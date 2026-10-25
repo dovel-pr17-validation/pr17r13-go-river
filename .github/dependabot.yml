@@ -1,0 +1,61 @@
+# Combine all routine version updates, including major releases, into one PR.
+# Add new ecosystems to this group so they share the same schedule.
+# https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-multi-ecosystem-updates
+
+version: 2
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Chicago"
+
+updates:
+  - package-ecosystem: "bundler"
+    directories:
+      - "/ruby"
+      - "/ruby/**/*"
+    cooldown:
+      default-days: 7
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+  - package-ecosystem: "cargo"
+    directory: "/rust"
+    cooldown:
+      default-days: 7
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+  - package-ecosystem: "github-actions"
+    # Scan every local composite action as well as the workflows.
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+  - package-ecosystem: "gomod"
+    directories:
+      - "**/*"
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+  - package-ecosystem: "maven"
+    directory: "/java"
+    cooldown:
+      default-days: 7
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+  # Exact pins in package.json (Prisma, the TypeScript-next preview, pnpm
+  # overrides) stay exact because `increase` rewrites the pinned version
+  # rather than widening it.
+  - package-ecosystem: "npm"
+    directory: "/js"
+    cooldown:
+      default-days: 7
+    multi-ecosystem-group: "dependencies"
+    patterns:
+      - "*"
+    versioning-strategy: increase

@@ -1,0 +1,1761 @@
+package riverdrivertest
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+
+	"github.com/riverqueue/river/internal/notifier"
+	"github.com/riverqueue/river/riverdriver"
+	"github.com/riverqueue/river/rivershared/testfactory"
+	"github.com/riverqueue/river/rivershared/uniquestates"
+	"github.com/riverqueue/river/rivershared/util/sliceutil"
+	"github.com/riverqueue/river/rivertype"
+)
+
+func exerciseJobUpdate[TTx any](ctx context.Context, t *testing.T, executorWithTx func(ctx context.Context, t *testing.T) (riverdriver.Executor, riverdriver.Driver[TTx])) {
+	t.Helper()
+
+	type testBundle struct {
+		driver riverdriver.Driver[TTx]
+	}
+
+	setup := func(ctx context.Context, t *testing.T) (riverdriver.Executor, *testBundle) {
+		t.Helper()
+
+		exec, driver := executorWithTx(ctx, t)
+
+		return exec, &testBundle{
+			driver: driver,
+		}
+	}
+
+	setStateManyParams := func(params ...*riverdriver.JobSetStateIfRunningParams) *riverdriver.JobSetStateIfRunningManyParams {
+		batchParams := &riverdriver.JobSetStateIfRunningManyParams{}
+		for _, param := range params {
+			var (
+				attempt     *int
+				errData     []byte
+				finalizedAt *time.Time
+				scheduledAt *time.Time
+			)
+			if param.Attempt != nil {
+				attempt = param.Attempt
+			}
+			if param.ErrData != nil {
+				errData = param.ErrData
+			}
+			if param.FinalizedAt != nil {
+				finalizedAt = param.FinalizedAt
+			}
+			if param.ScheduledAt != nil {
+				scheduledAt = param.ScheduledAt
+			}
+
+			batchParams.ID = append(batchParams.ID, param.ID)
+			batchParams.Attempt = append(batchParams.Attempt, attempt)
+			batchParams.ErrData = append(batchParams.ErrData, errData)
+			batchParams.FinalizedAt = append(batchParams.FinalizedAt, finalizedAt)
+			batchParams.MetadataDoMerge = append(batchParams.MetadataDoMerge, param.MetadataDoMerge)
+			batchParams.MetadataUpdates = append(batchParams.MetadataUpdates, param.MetadataUpdates)
+			batchParams.ScheduledAt = append(batchParams.ScheduledAt, scheduledAt)
+			batchParams.State = append(batchParams.State, param.State)
+		}
+
+		return batchParams
+	}
+
+	// Deliberately includes sub-millisecond precision so tests can verify that
+	// drivers normalize timestamps to their declared precision.
+	precisionTestTime := time.Date(2025, 4, 30, 13, 26, 39, 123400000, time.UTC)
+
+	t.Run("JobCancel", func(t *testing.T) {
+		t.Parallel()
+
+		for _, startingState := range []rivertype.JobState{
+			rivertype.JobStateAvailable,
+			rivertype.JobStateRetryable,
+			rivertype.JobStateScheduled,
+		} {
+			t.Run(fmt.Sprintf("CancelsJobIn%sState", strings.ToUpper(string(startingState[0]))+string(startingState)[1:]), func(t *testing.T) {
+				t.Parallel()
+
+				exec, _ := setup(ctx, t)
+
+				now := time.Now().UTC()
+				nowStr := now.Format(time.RFC3339Nano)
+
+				job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+					State:     &startingState,
+					UniqueKey: []byte("unique-key"),
+				})
+				require.Equal(t, startingState, job.State)
+
+				jobAfter, err := exec.JobCancel(ctx, &riverdriver.JobCancelParams{
+					ID:                job.ID,
+					CancelAttemptedAt: now,
+					ControlTopic:      string(notifier.NotificationTopicControl),
+				})
+				require.NoError(t, err)
+				require.NotNil(t, jobAfter)
+
+				require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
+				require.WithinDuration(t, time.Now(), *jobAfter.FinalizedAt, 2*time.Second)
+				require.JSONEq(t, fmt.Sprintf(`{"cancel_attempted_at":%q}`, nowStr), string(jobAfter.Metadata))
+			})
+		}
+
+		t.Run("RunningJobIsNotImmediatelyCancelled", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+			nowStr := now.Format(time.RFC3339Nano)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+			require.Equal(t, rivertype.JobStateRunning, job.State)
+
+			jobAfter, err := exec.JobCancel(ctx, &riverdriver.JobCancelParams{
+				ID:                job.ID,
+				CancelAttemptedAt: now,
+				ControlTopic:      string(notifier.NotificationTopicControl),
+			})
+			require.NoError(t, err)
+			require.NotNil(t, jobAfter)
+			require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
+			require.Nil(t, jobAfter.FinalizedAt)
+			require.JSONEq(t, fmt.Sprintf(`{"cancel_attempted_at":%q}`, nowStr), string(jobAfter.Metadata))
+			require.Equal(t, "unique-key", string(jobAfter.UniqueKey))
+		})
+
+		for _, startingState := range []rivertype.JobState{
+			rivertype.JobStateCancelled,
+			rivertype.JobStateCompleted,
+			rivertype.JobStateDiscarded,
+		} {
+			t.Run(fmt.Sprintf("DoesNotAlterFinalizedJobIn%sState", startingState), func(t *testing.T) {
+				t.Parallel()
+
+				exec, _ := setup(ctx, t)
+
+				job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+					FinalizedAt: new(time.Now()),
+					State:       &startingState,
+				})
+
+				jobAfter, err := exec.JobCancel(ctx, &riverdriver.JobCancelParams{
+					ID:                job.ID,
+					CancelAttemptedAt: time.Now(),
+					ControlTopic:      string(notifier.NotificationTopicControl),
+				})
+				require.NoError(t, err)
+				require.Equal(t, startingState, jobAfter.State)
+				require.WithinDuration(t, *job.FinalizedAt, *jobAfter.FinalizedAt, time.Microsecond)
+				require.JSONEq(t, `{}`, string(jobAfter.Metadata))
+			})
+		}
+
+		t.Run("ReturnsErrNotFoundIfJobDoesNotExist", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			jobAfter, err := exec.JobCancel(ctx, &riverdriver.JobCancelParams{
+				ID:                1234567890,
+				CancelAttemptedAt: time.Now(),
+				ControlTopic:      string(notifier.NotificationTopicControl),
+			})
+			require.ErrorIs(t, err, rivertype.ErrNotFound)
+			require.Nil(t, jobAfter)
+		})
+	})
+
+	t.Run("JobRescueMany", func(t *testing.T) {
+		t.Parallel()
+
+		exec, bundle := setup(ctx, t)
+
+		now := precisionTestTime
+
+		job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+			AttemptedAt: new(now.Add(-time.Hour)),
+			Metadata:    []byte(`{"river:rescue_count": 5, "something": "else"}`),
+			State:       new(rivertype.JobStateRunning),
+		})
+		job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+			AttemptedAt: new(now.Add(-time.Hour)),
+			Metadata:    []byte(`{}`),
+			State:       new(rivertype.JobStateRunning),
+		})
+
+		_, err := exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+			ID: []int64{
+				job1.ID,
+				job2.ID,
+			},
+			Error: [][]byte{
+				[]byte(`{"error": "message1"}`),
+				[]byte(`{"error": "message2"}`),
+			},
+			FinalizedAt: []*time.Time{
+				nil,
+				&now,
+			},
+			ScheduledAt: []time.Time{
+				now,
+				now,
+			},
+
+			State: []string{
+				string(rivertype.JobStateAvailable),
+				string(rivertype.JobStateDiscarded),
+			},
+			StuckHorizon: now,
+		})
+		require.NoError(t, err)
+
+		updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID})
+		require.NoError(t, err)
+		require.Equal(t, "message1", updatedJob1.Errors[0].Error)
+		require.Nil(t, updatedJob1.FinalizedAt)
+		require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), updatedJob1.ScheduledAt)
+		require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
+		require.JSONEq(t, `{"river:rescue_count": 6, "something": "else"}`, string(updatedJob1.Metadata))
+
+		updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID})
+		require.NoError(t, err)
+		require.Equal(t, "message2", updatedJob2.Errors[0].Error)
+		require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), *updatedJob2.FinalizedAt)
+		require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), updatedJob2.ScheduledAt)
+		require.Equal(t, rivertype.JobStateDiscarded, updatedJob2.State)
+		require.JSONEq(t, `{"river:rescue_count": 1}`, string(updatedJob2.Metadata))
+	})
+
+	t.Run("JobRescueMany_CompletedAfterFetch", func(t *testing.T) {
+		t.Parallel()
+
+		for _, rescueState := range []rivertype.JobState{
+			rivertype.JobStateCancelled,
+			rivertype.JobStateDiscarded,
+			rivertype.JobStateRetryable,
+		} {
+			t.Run(string(rescueState), func(t *testing.T) {
+				t.Parallel()
+
+				exec, bundle := setup(ctx, t)
+
+				now := precisionTestTime.Truncate(bundle.driver.TimePrecision())
+				jobOpts := &testfactory.JobOpts{
+					AttemptedAt: new(now.Add(-2 * time.Hour)),
+					Metadata:    []byte(`{"river:rescue_count": 5, "something": "else"}`),
+					ScheduledAt: new(now.Add(-2 * time.Hour)),
+					State:       new(rivertype.JobStateRunning),
+				}
+				job := testfactory.Job(ctx, t, exec, jobOpts)
+				stillRunningJob := testfactory.Job(ctx, t, exec, jobOpts)
+
+				stuckJobs, err := exec.JobGetStuck(ctx, &riverdriver.JobGetStuckParams{
+					Max:          10,
+					StuckHorizon: now.Add(-time.Hour),
+				})
+				require.NoError(t, err)
+				require.Len(t, stuckJobs, 2)
+				require.Equal(t, job.ID, stuckJobs[0].ID)
+				require.Equal(t, stillRunningJob.ID, stuckJobs[1].ID)
+
+				// Reproduce the interleaving deterministically: the worker completes
+				// after the rescuer fetches the job, but before its rescue write.
+				completedJobs, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+					riverdriver.JobSetStateCompleted(job.ID, now, []byte(`{"worker": "finished"}`)),
+				))
+				require.NoError(t, err)
+				require.Len(t, completedJobs, 1)
+				require.Equal(t, rivertype.JobStateCompleted, completedJobs[0].State)
+
+				completedJob, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+				require.NoError(t, err)
+
+				rescueAt := now.Add(time.Minute)
+				var finalizedAt *time.Time
+				if rescueState != rivertype.JobStateRetryable {
+					finalizedAt = &rescueAt
+				}
+
+				_, err = exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+					ID:           []int64{stuckJobs[0].ID, stuckJobs[1].ID},
+					Error:        [][]byte{[]byte(`{"error": "stale rescue"}`), []byte(`{"error": "stuck job rescued"}`)},
+					FinalizedAt:  []*time.Time{finalizedAt, finalizedAt},
+					ScheduledAt:  []time.Time{rescueAt, rescueAt},
+					State:        []string{string(rescueState), string(rescueState)},
+					StuckHorizon: now.Add(-time.Hour),
+				})
+				require.NoError(t, err)
+
+				rescuedJob, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: stillRunningJob.ID})
+				require.NoError(t, err)
+				require.Equal(t, rescueState, rescuedJob.State)
+				require.Equal(t, finalizedAt, rescuedJob.FinalizedAt)
+				require.Equal(t, rescueAt, rescuedJob.ScheduledAt)
+				require.Len(t, rescuedJob.Errors, 1)
+				require.Equal(t, "stuck job rescued", rescuedJob.Errors[0].Error)
+				require.JSONEq(t, `{"river:rescue_count": 6, "something": "else"}`, string(rescuedJob.Metadata))
+
+				jobAfterRescue, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+				require.NoError(t, err)
+				// Check the entire row, including errors, metadata, and timestamps.
+				require.Equal(t, completedJob, jobAfterRescue)
+			})
+		}
+	})
+
+	// SQLite only: stuck jobs with JSON columns that hold invalid JSON are
+	// rescued. An invalid `errors` value is wrapped in an array as a string so
+	// that the rescue error can be appended to it, and other invalid values are
+	// left in place.
+	t.Run("JobRescueMany_InvalidJSON", func(t *testing.T) {
+		t.Parallel()
+
+		exec, bundle := setup(ctx, t)
+		if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+			t.Skip("only SQLite's JSON columns can hold invalid JSON")
+		}
+
+		now := precisionTestTime
+
+		var (
+			invalidErrorsJob   = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{AttemptedAt: new(now.Add(-time.Hour)), State: new(rivertype.JobStateRunning)})
+			invalidMetadataJob = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{AttemptedAt: new(now.Add(-time.Hour)), State: new(rivertype.JobStateRunning)})
+		)
+		sqliteSetJobColumnMalformed(ctx, t, exec, invalidErrorsJob.ID, "errors")
+		sqliteSetJobColumnMalformed(ctx, t, exec, invalidMetadataJob.ID, "metadata")
+
+		_, err := exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+			ID:           []int64{invalidErrorsJob.ID, invalidMetadataJob.ID},
+			Error:        [][]byte{[]byte(`{"error": "message1"}`), []byte(`{"error": "message2"}`)},
+			FinalizedAt:  []*time.Time{nil, &now},
+			ScheduledAt:  []time.Time{now, now},
+			State:        []string{string(rivertype.JobStateAvailable), string(rivertype.JobStateDiscarded)},
+			StuckHorizon: now,
+		})
+		require.NoError(t, err)
+
+		updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: invalidErrorsJob.ID})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
+		require.Equal(t, []string{sqliteMalformedValue, "message1"},
+			sliceutil.Map(updatedJob1.Errors, func(e rivertype.AttemptError) string { return e.Error }))
+		require.JSONEq(t, `{"river:rescue_count": 1}`, string(updatedJob1.Metadata))
+
+		require.Equal(t, string(rivertype.JobStateDiscarded), sqliteJobColumnText(ctx, t, exec, invalidMetadataJob.ID, "state"))
+		require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, invalidMetadataJob.ID, "metadata"))
+	})
+
+	// SQLite can hold a non-array errors value on a stuck job. Rescue must
+	// preserve it and append the rescue error while updating the whole batch.
+	t.Run("JobRescueMany_NonArrayErrorsWrapped", func(t *testing.T) {
+		t.Parallel()
+
+		exec, bundle := setup(ctx, t)
+		if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+			t.Skip("only SQLite's JSON columns can hold a non-array errors value")
+		}
+
+		now := precisionTestTime
+		attemptedAt := now.Add(-time.Hour)
+		badJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{AttemptedAt: &attemptedAt, State: new(rivertype.JobStateRunning)})
+		goodJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{AttemptedAt: &attemptedAt, State: new(rivertype.JobStateRunning)})
+		sqliteSetJobJSONColumn(ctx, t, exec, badJob.ID, "errors", `{"error":"existing value"}`)
+
+		_, err := exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+			ID:           []int64{badJob.ID, goodJob.ID},
+			Error:        [][]byte{[]byte(`{"error":"rescue error"}`), []byte(`{"error":"rescue error"}`)},
+			FinalizedAt:  []*time.Time{nil, nil},
+			ScheduledAt:  []time.Time{now, now},
+			State:        []string{string(rivertype.JobStateRetryable), string(rivertype.JobStateRetryable)},
+			StuckHorizon: now,
+		})
+		require.NoError(t, err)
+
+		badAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: badJob.ID})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateRetryable, badAfter.State)
+		require.Equal(t, []string{"existing value", "rescue error"},
+			sliceutil.Map(badAfter.Errors, func(e rivertype.AttemptError) string { return e.Error }))
+
+		goodAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: goodJob.ID})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateRetryable, goodAfter.State)
+		require.Equal(t, "rescue error", goodAfter.Errors[0].Error)
+	})
+
+	t.Run("JobRescueMany_ReclaimedAfterFetch", func(t *testing.T) {
+		t.Parallel()
+
+		for _, release := range []struct {
+			name         string
+			setStateFunc func(int64, time.Time) *riverdriver.JobSetStateIfRunningParams
+		}{
+			{"Failed", func(id int64, now time.Time) *riverdriver.JobSetStateIfRunningParams {
+				return riverdriver.JobSetStateErrorAvailable(id, now, []byte(`{"error":"worker failed"}`), nil)
+			}},
+			{"Interrupted", func(id int64, now time.Time) *riverdriver.JobSetStateIfRunningParams {
+				return riverdriver.JobSetStateInterrupted(id, now, 0, nil)
+			}},
+		} {
+			t.Run(release.name, func(t *testing.T) {
+				t.Parallel()
+
+				exec, bundle := setup(ctx, t)
+
+				now := precisionTestTime.Truncate(bundle.driver.TimePrecision())
+				horizon := now.Add(-time.Hour)
+				job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+					Attempt:     new(1),
+					AttemptedAt: new(now.Add(-2 * time.Hour)),
+					Metadata:    []byte(`{"river:rescue_count":5}`),
+					ScheduledAt: new(now.Add(-2 * time.Hour)),
+					State:       new(rivertype.JobStateRunning),
+				})
+
+				stuckJobs, err := exec.JobGetStuck(ctx, &riverdriver.JobGetStuckParams{Max: 10, StuckHorizon: horizon})
+				require.NoError(t, err)
+				require.Len(t, stuckJobs, 1)
+				require.Equal(t, job.ID, stuckJobs[0].ID)
+
+				// The old worker releases the job and a new worker claims it before
+				// the rescuer writes its stale snapshot. State alone still matches.
+				releasedJobs, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(release.setStateFunc(job.ID, now)))
+				require.NoError(t, err)
+				require.Len(t, releasedJobs, 1)
+				require.Equal(t, rivertype.JobStateAvailable, releasedJobs[0].State)
+
+				claimRes, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+					ClientID:       "new-worker",
+					MaxAttemptedBy: 10,
+					MaxToLock:      1,
+					Now:            &now,
+					Queue:          job.Queue,
+				})
+				require.NoError(t, err)
+				claimedJobs := claimRes.Jobs
+				require.Len(t, claimedJobs, 1)
+				require.Equal(t, job.ID, claimedJobs[0].ID)
+				require.Equal(t, rivertype.JobStateRunning, claimedJobs[0].State)
+				require.True(t, claimedJobs[0].AttemptedAt.After(horizon))
+
+				_, err = exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+					ID:           []int64{stuckJobs[0].ID},
+					Error:        [][]byte{[]byte(`{"error":"stale rescue"}`)},
+					FinalizedAt:  []*time.Time{nil},
+					ScheduledAt:  []time.Time{now.Add(time.Minute)},
+					State:        []string{string(rivertype.JobStateRetryable)},
+					StuckHorizon: horizon,
+				})
+				require.NoError(t, err)
+
+				jobAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+				require.NoError(t, err)
+				require.Equal(t, claimedJobs[0], jobAfter)
+			})
+		}
+	})
+
+	t.Run("JobRescueMany_StuckHorizon", func(t *testing.T) {
+		t.Parallel()
+
+		exec, bundle := setup(ctx, t)
+
+		horizon := precisionTestTime.Truncate(bundle.driver.TimePrecision())
+		params := &riverdriver.JobRescueManyParams{StuckHorizon: horizon}
+		jobs := make([]*rivertype.JobRow, 0, 3)
+		for _, offset := range []time.Duration{-bundle.driver.TimePrecision(), 0, bundle.driver.TimePrecision()} {
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				AttemptedAt: new(horizon.Add(offset)),
+				State:       new(rivertype.JobStateRunning),
+			})
+			jobs = append(jobs, job)
+			params.ID = append(params.ID, job.ID)
+			params.Error = append(params.Error, []byte(`{"error":"stuck job rescued"}`))
+			params.FinalizedAt = append(params.FinalizedAt, nil)
+			params.ScheduledAt = append(params.ScheduledAt, horizon)
+			params.State = append(params.State, string(rivertype.JobStateRetryable))
+		}
+
+		_, err := exec.JobRescueMany(ctx, params)
+		require.NoError(t, err)
+
+		for i, job := range jobs {
+			jobAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			if i == 0 {
+				require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+				require.Len(t, jobAfter.Errors, 1)
+			} else {
+				// As in JobGetStuck, jobs at or after the horizon are ineligible.
+				require.Equal(t, job, jobAfter)
+			}
+		}
+	})
+
+	t.Run("JobRetry", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("DoesNotUpdateARunningJob", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State: new(rivertype.JobStateRunning),
+			})
+
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID: job.ID,
+			})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
+			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRunning, jobUpdated.State)
+		})
+
+		for _, state := range []rivertype.JobState{
+			rivertype.JobStateAvailable,
+			rivertype.JobStateCancelled,
+			rivertype.JobStateCompleted,
+			rivertype.JobStateDiscarded,
+			rivertype.JobStatePending,
+			rivertype.JobStateRetryable,
+			rivertype.JobStateScheduled,
+		} {
+			t.Run(fmt.Sprintf("UpdatesA_%s_JobToBeScheduledImmediately", state), func(t *testing.T) {
+				t.Parallel()
+
+				exec, bundle := setup(ctx, t)
+
+				now := time.Now().UTC()
+
+				setFinalized := slices.Contains([]rivertype.JobState{
+					rivertype.JobStateCancelled,
+					rivertype.JobStateCompleted,
+					rivertype.JobStateDiscarded,
+				}, state)
+
+				var finalizedAt *time.Time
+				if setFinalized {
+					finalizedAt = &now
+				}
+
+				job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+					FinalizedAt: finalizedAt,
+					ScheduledAt: new(now.Add(1 * time.Hour)),
+					State:       &state,
+				})
+
+				jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+					ID:  job.ID,
+					Now: &now,
+				})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+				require.WithinDuration(t, now, jobAfter.ScheduledAt, bundle.driver.TimePrecision())
+
+				jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
+				require.Nil(t, jobUpdated.FinalizedAt)
+			})
+		}
+
+		t.Run("AltersScheduledAtForAlreadyCompletedJob", func(t *testing.T) {
+			// A job which has already completed will have a ScheduledAt that could be
+			// long in the past. Now that we're re-scheduling it, we should update that
+			// to the current time to slot it in alongside other recently-scheduled jobs
+			// and not skip the line; also, its wait duration can't be calculated
+			// accurately if we don't reset the scheduled_at.
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				FinalizedAt: &now,
+				ScheduledAt: new(now.Add(-1 * time.Hour)),
+				State:       new(rivertype.JobStateCompleted),
+			})
+
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:  job.ID,
+				Now: &now,
+			})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+			require.WithinDuration(t, now, jobAfter.ScheduledAt, 5*time.Second)
+		})
+
+		t.Run("DoesNotAlterScheduledAtIfInThePastAndJobAlreadyAvailable", func(t *testing.T) {
+			// We don't want to update ScheduledAt if the job was already available
+			// because doing so can make it lose its place in line.
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt: new(now.Add(-1 * time.Hour)),
+			})
+
+			jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID:  job.ID,
+				Now: &now,
+			})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
+		})
+
+		t.Run("ReturnsErrNotFoundIfJobNotFound", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			_, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{
+				ID: 0,
+			})
+			require.Error(t, err)
+			require.ErrorIs(t, err, rivertype.ErrNotFound)
+		})
+	})
+
+	t.Run("JobSchedule", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("BasicScheduling", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			var (
+				horizon       = time.Now()
+				beforeHorizon = horizon.Add(-1 * time.Minute)
+				afterHorizon  = horizon.Add(1 * time.Minute)
+			)
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable)})
+			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateScheduled)})
+			job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateScheduled)})
+
+			// States that aren't scheduled.
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateAvailable)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: &beforeHorizon, ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateCompleted)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{FinalizedAt: &beforeHorizon, ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateDiscarded)})
+
+			// Right state, but after horizon.
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &afterHorizon, State: new(rivertype.JobStateRetryable)})
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &afterHorizon, State: new(rivertype.JobStateScheduled)})
+
+			// First two scheduled because of limit.
+			result, err := exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 2,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Len(t, result, 2)
+			// The batch is selected in priority/scheduled_at/ID order, but the
+			// Postgres query doesn't guarantee the order of returned rows.
+			require.ElementsMatch(t, []int64{job1.ID, job2.ID},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) int64 { return r.Job.ID }))
+			for _, scheduled := range result {
+				require.False(t, scheduled.ConflictDiscarded)
+			}
+
+			// And then job3 scheduled.
+			result, err = exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 2,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Len(t, result, 1)
+			require.Equal(t, job3.ID, result[0].Job.ID)
+			require.False(t, result[0].ConflictDiscarded)
+
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
+
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob2.State)
+
+			updatedJob3, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job3.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob3.State)
+		})
+
+		t.Run("HandlesUniqueConflicts", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			var (
+				horizon       = time.Now()
+				beforeHorizon = horizon.Add(-1 * time.Minute)
+			)
+
+			defaultUniqueStates := []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			}
+			// The default unique state list, minus retryable to allow for these conflicts:
+			nonRetryableUniqueStates := []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			}
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRetryable),
+				UniqueKey:    []byte("unique-key-1"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRetryable),
+				UniqueKey:    []byte("unique-key-2"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+			// job3 has no conflict (it's the only one with this key), so it should be
+			// scheduled.
+			job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRetryable),
+				UniqueKey:    []byte("unique-key-3"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(defaultUniqueStates),
+			})
+
+			// This one is a conflict with job1 because it's already running and has
+			// the same unique properties:
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRunning),
+				UniqueKey:    []byte("unique-key-1"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+			// This one is *not* a conflict with job2 because it's completed, which
+			// isn't in the unique states:
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateCompleted),
+				UniqueKey:    []byte("unique-key-2"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+
+			result, err := exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 100,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Len(t, result, 3)
+
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateDiscarded, updatedJob1.State)
+			require.Equal(t, "scheduler_discarded", gjson.GetBytes(updatedJob1.Metadata, "unique_key_conflict").String())
+
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob2.State)
+			require.False(t, gjson.GetBytes(updatedJob2.Metadata, "unique_key_conflict").Exists())
+
+			updatedJob3, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job3.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob3.State)
+			require.False(t, gjson.GetBytes(updatedJob3.Metadata, "unique_key_conflict").Exists())
+		})
+
+		// SQLite only: jobs with JSON columns that hold invalid JSON are
+		// scheduled (or discarded for a unique conflict) without failing the
+		// rest of the batch, and the invalid values are left in place.
+		t.Run("InvalidJSONJobsScheduledOrDiscarded", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold invalid JSON")
+			}
+
+			var (
+				horizon       = time.Now()
+				beforeHorizon = horizon.Add(-1 * time.Minute)
+				uniqueStates  = uniquestates.UniqueStatesToBitmask([]rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateRunning})
+			)
+
+			var (
+				goodJob        = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable)})
+				invalidJob     = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable)})
+				conflictingJob = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable), UniqueKey: []byte("unique-key"), UniqueStates: uniqueStates})
+			)
+			for _, column := range sqliteJobJSONColumns {
+				sqliteSetJobColumnMalformed(ctx, t, exec, invalidJob.ID, column)
+			}
+			sqliteSetJobColumnMalformed(ctx, t, exec, conflictingJob.ID, "metadata")
+
+			// The existing job has malformed metadata too, exercising the
+			// collision lookup as well as the discard update.
+			blockingJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:        new(rivertype.JobStateRunning),
+				UniqueKey:    []byte("unique-key"),
+				UniqueStates: uniqueStates,
+			})
+			sqliteSetJobColumnMalformed(ctx, t, exec, blockingJob.ID, "metadata")
+
+			result, err := exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 100,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Equal(t, []int64{goodJob.ID, invalidJob.ID, conflictingJob.ID},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) int64 { return r.Job.ID }))
+			require.Equal(t, []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateAvailable, rivertype.JobStateDiscarded},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) rivertype.JobState { return r.Job.State }))
+			require.Equal(t, []bool{false, false, true},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) bool { return r.ConflictDiscarded }))
+
+			for _, column := range sqliteJobJSONColumns {
+				require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, invalidJob.ID, column))
+			}
+			require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, conflictingJob.ID, "metadata"))
+			require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, blockingJob.ID, "metadata"))
+		})
+
+		// SQLite only: jobs whose rows can't be decoded are scheduled (or
+		// discarded for a unique conflict) without failing the rest of the
+		// batch, and the undecodable values are left in place.
+		t.Run("UndecodableJobsScheduled", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold values that don't decode")
+			}
+
+			var (
+				horizon       = time.Now()
+				beforeHorizon = horizon.Add(-1 * time.Minute)
+				uniqueStates  = uniquestates.UniqueStatesToBitmask([]rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateRunning})
+			)
+
+			var (
+				goodJob           = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable)})
+				undecodableJob    = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable)})
+				conflictingJob    = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateRetryable), UniqueKey: []byte("unique-key"), UniqueStates: uniqueStates})
+				scheduledJob      = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: &beforeHorizon, State: new(rivertype.JobStateScheduled)})
+				undecodableValue  = `{"not":"an array"}`
+				expectedJobIDs    = []int64{goodJob.ID, undecodableJob.ID, conflictingJob.ID, scheduledJob.ID}
+				undecodableJobIDs = []int64{undecodableJob.ID, conflictingJob.ID, scheduledJob.ID}
+			)
+			for _, jobID := range undecodableJobIDs {
+				sqliteSetJobJSONColumn(ctx, t, exec, jobID, "tags", undecodableValue)
+			}
+
+			// Conflicts with conflictingJob, which is discarded instead of scheduled.
+			_ = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:        new(rivertype.JobStateRunning),
+				UniqueKey:    []byte("unique-key"),
+				UniqueStates: uniqueStates,
+			})
+
+			result, err := exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 100,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Equal(t, expectedJobIDs,
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) int64 { return r.Job.ID }))
+			require.Equal(t, []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateAvailable, rivertype.JobStateDiscarded, rivertype.JobStateAvailable},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) rivertype.JobState { return r.Job.State }))
+			require.Equal(t, []bool{false, false, true, false},
+				sliceutil.Map(result, func(r *riverdriver.JobScheduleResult) bool { return r.ConflictDiscarded }))
+
+			// Fields that could be decoded are set, while the others are empty.
+			require.Equal(t, []string{}, result[0].Job.Tags)
+			require.Nil(t, result[1].Job.Tags)
+			require.Equal(t, conflictingJob.Kind, result[2].Job.Kind)
+
+			// The undecodable values are left as they were.
+			for _, jobID := range undecodableJobIDs {
+				_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: jobID})
+				require.ErrorContains(t, err, "error unmarshaling `tags`")
+			}
+		})
+
+		t.Run("SchedulingTwoRetryableJobsThatWillConflictWithEachOther", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			var (
+				horizon       = time.Now()
+				beforeHorizon = horizon.Add(-1 * time.Minute)
+			)
+
+			// The default unique state list, minus retryable to allow for these conflicts:
+			nonRetryableUniqueStates := []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			}
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRetryable),
+				UniqueKey:    []byte("unique-key-1"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				ScheduledAt:  &beforeHorizon,
+				State:        new(rivertype.JobStateRetryable),
+				UniqueKey:    []byte("unique-key-1"),
+				UniqueStates: uniquestates.UniqueStatesToBitmask(nonRetryableUniqueStates),
+			})
+
+			result, err := exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{
+				Max: 100,
+				Now: &horizon,
+			})
+			require.NoError(t, err)
+			require.Len(t, result, 2)
+
+			updatedJob1, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateAvailable, updatedJob1.State)
+			require.False(t, gjson.GetBytes(updatedJob1.Metadata, "unique_key_conflict").Exists())
+
+			updatedJob2, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateDiscarded, updatedJob2.State)
+			require.Equal(t, "scheduler_discarded", gjson.GetBytes(updatedJob2.Metadata, "unique_key_conflict").String())
+		})
+	})
+
+	makeErrPayload := func(t *testing.T, now time.Time) []byte {
+		t.Helper()
+
+		errPayload, err := json.Marshal(rivertype.AttemptError{
+			Attempt: 1, At: now, Error: "fake error", Trace: "foo.go:123\nbar.go:456",
+		})
+		require.NoError(t, err)
+		return errPayload
+	}
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateCompleted", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("CompletesARunningJob", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := precisionTestTime
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
+			require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), *jobAfter.FinalizedAt)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateCompleted, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+
+		t.Run("DoesNotCompleteARetryableJob", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:     new(rivertype.JobStateRetryable),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			require.Nil(t, jobAfter.FinalizedAt)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+
+		t.Run("StoresMetadataUpdates", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata:  []byte(`{"foo":"baz", "something":"else"}`),
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(job.ID, now, []byte(`{"a":"b", "foo":"bar"}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateCompleted, jobAfter.State)
+			require.JSONEq(t, `{"a":"b", "foo":"bar", "something":"else"}`, string(jobAfter.Metadata))
+		})
+
+		t.Run("UnknownJobIgnored", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			// The operation doesn't return anything like a "not found" in case
+			// of an unknown job so that it doesn't fail in case a job is
+			// deleted in the interim as a completer is trying to finalize it.
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCompleted(0, time.Now().UTC(), nil)))
+			require.NoError(t, err)
+			require.Empty(t, jobsAfter)
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateErrored", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("SetsARunningJobToRetryable", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := precisionTestTime
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), jobAfter.ScheduledAt)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+
+			// validate error payload:
+			require.Len(t, jobAfter.Errors, 1)
+			require.Equal(t, now, jobAfter.Errors[0].At)
+			require.Equal(t, 1, jobAfter.Errors[0].Attempt)
+			require.Equal(t, "fake error", jobAfter.Errors[0].Error)
+			require.Equal(t, "foo.go:123\nbar.go:456", jobAfter.Errors[0].Trace)
+		})
+
+		// SQLite only: an `errors` value that isn't valid JSON is wrapped in an
+		// array as a string so that the new error can be appended without
+		// losing the existing value.
+		t.Run("InvalidJSONErrorsWrappedToAppend", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold invalid JSON")
+			}
+
+			now := precisionTestTime
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+			sqliteSetJobColumnMalformed(ctx, t, exec, job.ID, "errors")
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			require.Len(t, jobsAfter, 1)
+			require.Equal(t, rivertype.JobStateRetryable, jobsAfter[0].State)
+			require.Equal(t, []string{sqliteMalformedValue, "fake error"},
+				sliceutil.Map(jobsAfter[0].Errors, func(e rivertype.AttemptError) string { return e.Error }))
+		})
+
+		// SQLite only: a job with JSON columns that hold invalid JSON still has
+		// its state set with the invalid values left in place, and doesn't
+		// prevent setting the state of other jobs in the same batch, including
+		// when it's no longer running and only its metadata would be updated.
+		t.Run("InvalidJSONJobSetAlongsideOthers", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold invalid JSON")
+			}
+
+			now := precisionTestTime
+
+			var (
+				goodJob       = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+				invalidJob    = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+				notRunningJob = testfactory.Job(ctx, t, exec, &testfactory.JobOpts{ScheduledAt: new(now.Add(time.Hour)), State: new(rivertype.JobStateRetryable)})
+			)
+			for _, column := range []string{"args", "attempted_by", "metadata", "tags"} {
+				sqliteSetJobColumnMalformed(ctx, t, exec, invalidJob.ID, column)
+			}
+			sqliteSetJobColumnMalformed(ctx, t, exec, notRunningJob.ID, "metadata")
+
+			metadataUpdates := []byte(`{"foo":"bar"}`)
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+				riverdriver.JobSetStateErrorRetryable(goodJob.ID, now, makeErrPayload(t, now), metadataUpdates),
+				riverdriver.JobSetStateErrorRetryable(invalidJob.ID, now, makeErrPayload(t, now), metadataUpdates),
+				riverdriver.JobSetStateErrorRetryable(notRunningJob.ID, now, makeErrPayload(t, now), metadataUpdates),
+			))
+			require.NoError(t, err)
+			require.Equal(t, []int64{goodJob.ID, invalidJob.ID, notRunningJob.ID},
+				sliceutil.Map(jobsAfter, func(j *rivertype.JobRow) int64 { return j.ID }))
+			for _, jobAfter := range jobsAfter {
+				require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			}
+
+			require.JSONEq(t, `{"foo":"bar"}`, string(jobsAfter[0].Metadata))
+			require.Len(t, jobsAfter[0].Errors, 1)
+
+			require.Len(t, jobsAfter[1].Errors, 1)
+			require.Equal(t, "fake error", jobsAfter[1].Errors[0].Error)
+			require.Nil(t, jobsAfter[1].Tags)
+			for _, column := range []string{"args", "attempted_by", "metadata", "tags"} {
+				require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, invalidJob.ID, column))
+			}
+
+			require.Empty(t, jobsAfter[2].Errors)
+			require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, notRunningJob.ID, "metadata"))
+		})
+
+		// SQLite only: a non-array `errors` value is wrapped in an array so that
+		// the new error can be appended without losing the existing value.
+		t.Run("NonArrayErrorsWrappedToAppend", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold a non-array errors value")
+			}
+
+			now := precisionTestTime
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+			sqliteSetJobJSONColumn(ctx, t, exec, job.ID, "errors", `{"error":"existing value"}`)
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			require.Len(t, jobsAfter, 1)
+			require.Equal(t, rivertype.JobStateRetryable, jobsAfter[0].State)
+			require.Equal(t, []string{"existing value", "fake error"},
+				sliceutil.Map(jobsAfter[0].Errors, func(e rivertype.AttemptError) string { return e.Error }))
+		})
+
+		t.Run("SetsAnInterruptedRunningJobToAvailableWithUpdatedAttempt", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := time.Now().UTC()
+			attempt := 2
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:     new(3),
+				MaxAttempts: new(3),
+				State:       new(rivertype.JobStateRunning),
+				UniqueKey:   []byte("unique-key"),
+			})
+
+			params := riverdriver.JobSetStateInterrupted(job.ID, now, attempt, nil)
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(params))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, attempt, jobAfter.Attempt)
+			require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+			require.Equal(t, 3, jobAfter.MaxAttempts)
+			require.WithinDuration(t, now, jobAfter.ScheduledAt, bundle.driver.TimePrecision())
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, attempt, jobUpdated.Attempt)
+			require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
+			require.Equal(t, 3, jobUpdated.MaxAttempts)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+
+			require.Empty(t, jobAfter.Errors)
+		})
+
+		t.Run("DoesNotTouchAlreadyRetryableJobWithNoMetadataUpdates", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:       new(rivertype.JobStateRetryable),
+				ScheduledAt: new(now.Add(10 * time.Second)),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateErrorRetryable(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
+			require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+		})
+
+		// A job whose row can't be fully decoded still has its state set, and
+		// doesn't prevent setting the state of other jobs in the same batch.
+		t.Run("UndecodableJobSetAlongsideOthers", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold values that don't decode")
+			}
+
+			now := precisionTestTime
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+			job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+			sqliteSetJobJSONColumn(ctx, t, exec, job2.ID, "tags", `{"not":"an array"}`)
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+				riverdriver.JobSetStateErrorRetryable(job1.ID, now, makeErrPayload(t, now), nil),
+				riverdriver.JobSetStateErrorRetryable(job2.ID, now, makeErrPayload(t, now), nil),
+			))
+			require.NoError(t, err)
+			require.Len(t, jobsAfter, 2)
+			for _, jobAfter := range jobsAfter {
+				require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+				require.Len(t, jobAfter.Errors, 1)
+			}
+			require.Equal(t, job2.ID, jobsAfter[1].ID)
+			require.Nil(t, jobsAfter[1].Tags)
+
+			// The undecodable value is left as it was.
+			_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job2.ID})
+			require.ErrorContains(t, err, "error unmarshaling `tags`")
+		})
+
+		// A metadata merge replaces each top-level value outright instead of
+		// merging into it, and stores a JSON null instead of removing the key.
+		// A resumable job relies on this to drop the cursors of completed steps.
+		t.Run("MetadataUpdatesReplaceTopLevelValues", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			const (
+				metadataBefore  = `{"gone":5, "keep":{"x":1}, "river:resumable_cursor":{"c":1}, "river:resumable_step":"a"}`
+				metadataUpdates = `{"gone":null, "river:resumable_cursor":{"d":7, "n":null}, "river:resumable_step":"c"}`
+				metadataAfter   = `{"gone":null, "keep":{"x":1}, "river:resumable_cursor":{"d":7, "n":null}, "river:resumable_step":"c"}`
+			)
+
+			runningJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(metadataBefore),
+				State:    new(rivertype.JobStateRunning),
+			})
+			retryableJob := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata:    []byte(metadataBefore),
+				ScheduledAt: new(now.Add(10 * time.Second)),
+				State:       new(rivertype.JobStateRetryable),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+				riverdriver.JobSetStateErrorRetryable(runningJob.ID, now, makeErrPayload(t, now), []byte(metadataUpdates)),
+				riverdriver.JobSetStateErrorRetryable(retryableJob.ID, now, makeErrPayload(t, now), []byte(metadataUpdates)),
+			))
+			require.NoError(t, err)
+			require.Len(t, jobsAfter, 2)
+			require.JSONEq(t, metadataAfter, string(jobsAfter[0].Metadata))
+			require.JSONEq(t, metadataAfter, string(jobsAfter[1].Metadata))
+		})
+
+		t.Run("UpdatesOnlyMetadataForAlreadyRetryableJobs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata:    []byte(`{"baz":"qux", "foo":"bar"}`),
+				State:       new(rivertype.JobStateRetryable),
+				ScheduledAt: new(now.Add(10 * time.Second)),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+				riverdriver.JobSetStateErrorRetryable(job1.ID, now, makeErrPayload(t, now), []byte(`{"foo":"1", "output":{"a":"b"}}`)),
+			))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+			require.JSONEq(t, `{"baz":"qux", "foo":"1", "output":{"a":"b"}}`, string(jobAfter.Metadata))
+			require.Empty(t, jobAfter.Errors)
+			require.Equal(t, job1.ScheduledAt, jobAfter.ScheduledAt)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job1.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRetryable, jobUpdated.State)
+			require.JSONEq(t, `{"baz":"qux", "foo":"1", "output":{"a":"b"}}`, string(jobUpdated.Metadata))
+			require.Empty(t, jobUpdated.Errors)
+			require.Equal(t, job1.ScheduledAt, jobUpdated.ScheduledAt)
+		})
+
+		t.Run("SetsAJobWithCancelAttemptedAtToCancelled", func(t *testing.T) {
+			t.Parallel()
+
+			// If a job has cancel_attempted_at in its metadata, it means that the user
+			// tried to cancel the job with the Cancel API but that the job
+			// finished/errored before the producer received the cancel notification.
+			// In this case, move the job to cancelled so that it is not retried.
+			tests := []struct {
+				name         string
+				setStateFunc func(id int64, scheduledAt time.Time, errData []byte, metadataUpdates []byte) *riverdriver.JobSetStateIfRunningParams
+			}{
+				{name: "ImmediatelyAvailable", setStateFunc: riverdriver.JobSetStateErrorAvailable},
+				{name: "Retryable", setStateFunc: riverdriver.JobSetStateErrorRetryable},
+			}
+
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := setup(ctx, t)
+
+					now := time.Now().UTC()
+					job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+						Metadata:    fmt.Appendf(nil, `{"cancel_attempted_at":"%s"}`, time.Now().UTC().Format(time.RFC3339)),
+						State:       new(rivertype.JobStateRunning),
+						ScheduledAt: new(now.Add(-10 * time.Second)),
+					})
+
+					jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(test.setStateFunc(job.ID, now, makeErrPayload(t, now), nil)))
+					require.NoError(t, err)
+					jobAfter := jobsAfter[0]
+					require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
+					require.NotNil(t, jobAfter.FinalizedAt)
+					require.WithinDuration(t, time.Now().UTC(), *jobAfter.FinalizedAt, 2*time.Second)
+					require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+
+					require.Len(t, jobAfter.Errors, 1)
+					require.Contains(t, jobAfter.Errors[0].Error, "fake error")
+
+					jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+					require.NoError(t, err)
+					require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
+					require.WithinDuration(t, job.ScheduledAt, jobAfter.ScheduledAt, time.Microsecond)
+				})
+			}
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateCancelled", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("CancelsARunningJob", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:        new(rivertype.JobStateRunning),
+				UniqueKey:    []byte("unique-key"),
+				UniqueStates: 0xFF,
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateCancelled(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateCancelled, jobAfter.State)
+			require.WithinDuration(t, now, *jobAfter.FinalizedAt, bundle.driver.TimePrecision())
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateCancelled, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateDiscarded", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("DiscardsARunningJob", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := time.Now().UTC()
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				State:        new(rivertype.JobStateRunning),
+				UniqueKey:    []byte("unique-key"),
+				UniqueStates: 0xFF,
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateDiscarded(job.ID, now, makeErrPayload(t, now), nil)))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, rivertype.JobStateDiscarded, jobAfter.State)
+			require.WithinDuration(t, now, *jobAfter.FinalizedAt, bundle.driver.TimePrecision())
+			require.Equal(t, "unique-key", string(jobAfter.UniqueKey))
+			require.Equal(t, rivertype.JobStates(), jobAfter.UniqueStates)
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateDiscarded, jobUpdated.State)
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_JobSetStateSnoozed", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("SnoozesARunningJob_WithNoPreexistingMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := time.Now().UTC()
+			snoozeUntil := now.Add(1 * time.Minute)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:   new(5),
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateSnoozed(job.ID, snoozeUntil, 4, []byte(`{"snoozes": 1}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, 4, jobAfter.Attempt)
+			require.Equal(t, job.MaxAttempts, jobAfter.MaxAttempts)
+			require.JSONEq(t, `{"snoozes": 1}`, string(jobAfter.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobAfter.State)
+			require.WithinDuration(t, snoozeUntil, jobAfter.ScheduledAt, bundle.driver.TimePrecision())
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, 4, jobUpdated.Attempt)
+			require.Equal(t, job.MaxAttempts, jobUpdated.MaxAttempts)
+			require.JSONEq(t, `{"snoozes": 1}`, string(jobUpdated.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+
+		t.Run("SnoozesARunningJob_WithPreexistingMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			now := time.Now().UTC()
+			snoozeUntil := now.Add(1 * time.Minute)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:   new(5),
+				State:     new(rivertype.JobStateRunning),
+				UniqueKey: []byte("unique-key"),
+				Metadata:  []byte(`{"foo": "bar", "snoozes": 5}`),
+			})
+
+			jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(riverdriver.JobSetStateSnoozed(job.ID, snoozeUntil, 4, []byte(`{"snoozes": 6}`))))
+			require.NoError(t, err)
+			jobAfter := jobsAfter[0]
+			require.Equal(t, 4, jobAfter.Attempt)
+			require.Equal(t, job.MaxAttempts, jobAfter.MaxAttempts)
+			require.JSONEq(t, `{"foo": "bar", "snoozes": 6}`, string(jobAfter.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobAfter.State)
+			require.WithinDuration(t, snoozeUntil, jobAfter.ScheduledAt, bundle.driver.TimePrecision())
+
+			jobUpdated, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: ""})
+			require.NoError(t, err)
+			require.Equal(t, 4, jobUpdated.Attempt)
+			require.Equal(t, job.MaxAttempts, jobUpdated.MaxAttempts)
+			require.JSONEq(t, `{"foo": "bar", "snoozes": 6}`, string(jobUpdated.Metadata))
+			require.Equal(t, rivertype.JobStateScheduled, jobUpdated.State)
+			require.Equal(t, "unique-key", string(jobUpdated.UniqueKey))
+		})
+	})
+
+	t.Run("JobSetStateIfRunningMany_MultipleJobsAtOnce", func(t *testing.T) {
+		t.Parallel()
+
+		exec, bundle := setup(ctx, t)
+
+		now := time.Now().UTC()
+		future := now.Add(10 * time.Second)
+
+		job1 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+		job2 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+		job3 := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRunning)})
+
+		jobsAfter, err := exec.JobSetStateIfRunningMany(ctx, setStateManyParams(
+			riverdriver.JobSetStateCompleted(0, now, nil),
+			riverdriver.JobSetStateCompleted(job1.ID, now, []byte(`{"a":"b"}`)),
+			riverdriver.JobSetStateErrorRetryable(job2.ID, future, makeErrPayload(t, now), nil),
+			riverdriver.JobSetStateCancelled(job3.ID, now, makeErrPayload(t, now), nil),
+		))
+		require.NoError(t, err)
+		require.Len(t, jobsAfter, 3)
+		completedJob := jobsAfter[0]
+		require.Equal(t, rivertype.JobStateCompleted, completedJob.State)
+		require.WithinDuration(t, now, *completedJob.FinalizedAt, bundle.driver.TimePrecision())
+		require.JSONEq(t, `{"a":"b"}`, string(completedJob.Metadata))
+
+		retryableJob := jobsAfter[1]
+		require.Equal(t, rivertype.JobStateRetryable, retryableJob.State)
+		require.WithinDuration(t, future, retryableJob.ScheduledAt, bundle.driver.TimePrecision())
+		// validate error payload:
+		require.Len(t, retryableJob.Errors, 1)
+		require.Equal(t, now, retryableJob.Errors[0].At)
+		require.Equal(t, 1, retryableJob.Errors[0].Attempt)
+		require.Equal(t, "fake error", retryableJob.Errors[0].Error)
+		require.Equal(t, "foo.go:123\nbar.go:456", retryableJob.Errors[0].Trace)
+
+		cancelledJob := jobsAfter[2]
+		require.Equal(t, rivertype.JobStateCancelled, cancelledJob.State)
+		require.WithinDuration(t, now, *cancelledJob.FinalizedAt, bundle.driver.TimePrecision())
+	})
+
+	t.Run("JobUpdate", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("AllArgs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(`{"key1":"val1"}`),
+			})
+
+			updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+				ID:              job.ID,
+				MetadataDoMerge: true,
+				Metadata:        []byte(`{"key2":"val2"}`),
+			})
+			require.NoError(t, err)
+			require.JSONEq(t, `{"key1":"val1","key2":"val2"}`, string(updatedJob.Metadata))
+		})
+
+		t.Run("MetadataMergePreservesJSONValuesAndLiteralKeys", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(`{"keep":123456789012345678901234567890,"\u0061":{"old":true},"a.b":{"old":true},"empty":{"old":true},"nullable":1}`),
+			})
+			updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+				ID:              job.ID,
+				MetadataDoMerge: true,
+				Metadata:        []byte(`{"":false,"a":{"new":true},"a.b":{"new":true},"a\"b.c":[true,false,null],"a\\b":null,"<key>&":true,"é":{},"empty":{},"nullable":null,"large":9007199254740993}`),
+			})
+			require.NoError(t, err)
+			require.JSONEq(t, `{"keep":123456789012345678901234567890,"":false,"a":{"new":true},"a.b":{"new":true},"a\"b.c":[true,false,null],"a\\b":null,"<key>&":true,"é":{},"empty":{},"nullable":null,"large":9007199254740993}`, string(updatedJob.Metadata))
+			require.Equal(t, "123456789012345678901234567890", gjson.GetBytes(updatedJob.Metadata, "keep").Raw)
+			require.Equal(t, "9007199254740993", gjson.GetBytes(updatedJob.Metadata, "large").Raw)
+			require.True(t, gjson.GetBytes(updatedJob.Metadata, "a.new").Bool())
+		})
+
+		t.Run("MetadataMergeReplacesTopLevelValues", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(`{"gone":5, "keep":{"x":1}, "river:resumable_cursor":{"c":1}, "river:resumable_step":"a"}`),
+			})
+
+			updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+				ID:              job.ID,
+				MetadataDoMerge: true,
+				Metadata:        []byte(`{"gone":null, "river:resumable_cursor":{"d":7, "n":null}, "river:resumable_step":"c"}`),
+			})
+			require.NoError(t, err)
+			require.JSONEq(t,
+				`{"gone":null, "keep":{"x":1}, "river:resumable_cursor":{"d":7, "n":null}, "river:resumable_step":"c"}`,
+				string(updatedJob.Metadata),
+			)
+		})
+
+		t.Run("MetadataMergeWithManyKeys", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			updates := make(map[string]any, 1200)
+			for i := range 1200 {
+				updates[fmt.Sprintf("key_%04d", i)] = map[string]any{"value": i, "nullable": nil}
+			}
+			encoded, err := json.Marshal(updates)
+			require.NoError(t, err)
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(`{"keep":true,"key_0000":{"old":true}}`),
+			})
+			updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+				ID:              job.ID,
+				MetadataDoMerge: true,
+				Metadata:        encoded,
+			})
+			require.NoError(t, err)
+			updates["keep"] = true
+			expected, err := json.Marshal(updates)
+			require.NoError(t, err)
+			require.JSONEq(t, string(expected), string(updatedJob.Metadata))
+		})
+
+		t.Run("MetadataMergeWithNonObjectMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			for _, before := range []string{`[1,true,null]`, `true`, `42`, `"text"`, `null`} {
+				t.Run(before, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := setup(ctx, t)
+
+					job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Metadata: []byte(before)})
+					updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+						ID:              job.ID,
+						MetadataDoMerge: true,
+						Metadata:        []byte(`{"new":null}`),
+					})
+					require.NoError(t, err)
+					expected := "[" + before + `,{"new":null}]`
+					if strings.HasPrefix(before, "[") {
+						expected = strings.TrimSuffix(before, "]") + `,{"new":null}]`
+					}
+					require.JSONEq(t, expected, string(updatedJob.Metadata))
+				})
+			}
+		})
+
+		t.Run("NoArgs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Metadata: []byte(`{"key1":"val1"}`),
+			})
+
+			updatedJob, err := exec.JobUpdate(ctx, &riverdriver.JobUpdateParams{
+				ID: job.ID,
+			})
+			require.NoError(t, err)
+			require.JSONEq(t, `{"key1":"val1"}`, string(updatedJob.Metadata))
+		})
+	})
+
+	t.Run("JobUpdateFull", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("AllArgs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
+
+			now := precisionTestTime
+
+			updatedJob, err := exec.JobUpdateFull(ctx, &riverdriver.JobUpdateFullParams{
+				ID:                  job.ID,
+				AttemptDoUpdate:     true,
+				Attempt:             7,
+				AttemptedAtDoUpdate: true,
+				AttemptedAt:         &now,
+				AttemptedByDoUpdate: true,
+				AttemptedBy:         []string{"worker1"},
+				ErrorsDoUpdate:      true,
+				Errors:              [][]byte{[]byte(`{"error":"message"}`)},
+				FinalizedAtDoUpdate: true,
+				FinalizedAt:         &now,
+				MaxAttemptsDoUpdate: true,
+				MaxAttempts:         99,
+				MetadataDoUpdate:    true,
+				Metadata:            []byte(`{"foo":"bar"}`),
+				StateDoUpdate:       true,
+				State:               rivertype.JobStateDiscarded,
+			})
+			require.NoError(t, err)
+			require.Equal(t, 7, updatedJob.Attempt)
+			require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), *updatedJob.AttemptedAt)
+			require.Equal(t, []string{"worker1"}, updatedJob.AttemptedBy)
+			require.Equal(t, "message", updatedJob.Errors[0].Error)
+			require.Equal(t, now.Truncate(bundle.driver.TimePrecision()), *updatedJob.FinalizedAt)
+			require.Equal(t, 99, updatedJob.MaxAttempts)
+			require.JSONEq(t, `{"foo":"bar"}`, string(updatedJob.Metadata))
+			require.Equal(t, rivertype.JobStateDiscarded, updatedJob.State)
+		})
+
+		t.Run("NoArgs", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := setup(ctx, t)
+
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{})
+
+			updatedJob, err := exec.JobUpdateFull(ctx, &riverdriver.JobUpdateFullParams{
+				ID: job.ID,
+			})
+			require.NoError(t, err)
+			require.Equal(t, job.Attempt, updatedJob.Attempt)
+			require.Nil(t, updatedJob.AttemptedAt)
+			require.Empty(t, updatedJob.AttemptedBy)
+			require.Empty(t, updatedJob.Errors)
+			require.Nil(t, updatedJob.FinalizedAt)
+			require.Equal(t, job.MaxAttempts, updatedJob.MaxAttempts)
+			require.Equal(t, job.Metadata, updatedJob.Metadata)
+			require.Equal(t, job.State, updatedJob.State)
+		})
+	})
+}

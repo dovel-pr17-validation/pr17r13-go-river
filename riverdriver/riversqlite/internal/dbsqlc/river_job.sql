@@ -1,0 +1,811 @@
+CREATE TABLE river_job (
+    -- AUTOINCREMENT prevents SQLite from reusing the IDs of deleted jobs.
+    id integer PRIMARY KEY AUTOINCREMENT,
+    args jsonb NOT NULL DEFAULT (jsonb('{}')),
+    attempt integer NOT NULL DEFAULT 0,
+    attempted_at timestamp,
+    attempted_by jsonb, -- JSON array of strings
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    errors jsonb, -- JSON array of error objects
+    finalized_at timestamp,
+    kind text NOT NULL,
+    max_attempts integer NOT NULL DEFAULT 25,
+    metadata jsonb NOT NULL DEFAULT (jsonb('{}')),
+    priority integer NOT NULL DEFAULT 1,
+    queue text NOT NULL DEFAULT 'default',
+    state text NOT NULL DEFAULT 'available',
+    scheduled_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tags jsonb NOT NULL DEFAULT (jsonb('[]')), -- JSON array of strings
+    unique_key blob,
+    unique_states integer,
+    CONSTRAINT finalized_or_finalized_at_null CHECK (
+        (finalized_at IS NULL AND state NOT IN ('cancelled', 'completed', 'discarded')) OR
+        (finalized_at IS NOT NULL AND state IN ('cancelled', 'completed', 'discarded'))
+    ),
+    CONSTRAINT priority_in_range CHECK (priority >= 1 AND priority <= 4),
+    CONSTRAINT queue_length CHECK (length(queue) > 0 AND length(queue) < 128),
+    CONSTRAINT kind_length CHECK (length(kind) > 0 AND length(kind) < 128),
+    CONSTRAINT state_valid CHECK (state IN ('available', 'cancelled', 'completed', 'discarded', 'pending', 'retryable', 'running', 'scheduled'))
+);
+
+-- Differs by necessity from other drivers because SQLite doesn't support
+-- `UPDATE` inside CTEs so we can't retry if running but select otherwise.
+-- Instead, the driver uses a transaction to optimisticaly try an update, but
+-- perform a subsequent fetch on a not found to return the right status.
+--
+-- I had to invert the last 'AND' expression below (was an 'ANT NOT) due to an
+-- sqlc bug. Something about sqlc's SQLite parser cannot detect a parameter
+-- inside an `AND NOT`.
+-- name: JobCancel :one
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    -- If the job is actively running, we want to let its current client and
+    -- producer handle the cancellation. Otherwise, immediately cancel it.
+    state = CASE WHEN state = 'running' THEN state ELSE 'cancelled' END,
+    finalized_at = CASE WHEN state = 'running' THEN finalized_at ELSE coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec')) END,
+    -- Mark the job as cancelled by query so that the rescuer knows not to
+    -- rescue it, even if it gets stuck in the running state:
+    metadata = jsonb_set(metadata, '$.cancel_attempted_at', cast(@cancel_attempted_at AS text))
+WHERE id = @id
+    AND state NOT IN ('cancelled', 'completed', 'discarded')
+    AND finalized_at IS NULL
+RETURNING *;
+
+-- name: JobCountByAllStates :many
+SELECT state, count(*)
+FROM /* TEMPLATE: schema */river_job
+GROUP BY state;
+
+-- name: JobCountByQueueAndState :many
+WITH queue_stats AS (
+    SELECT
+        river_job.queue,
+        COUNT(CASE WHEN river_job.state = 'available' THEN 1 END) AS count_available,
+        COUNT(CASE WHEN river_job.state = 'running' THEN 1 END) AS count_running
+    FROM /* TEMPLATE: schema */river_job
+    WHERE river_job.queue IN (sqlc.slice('queue_names'))
+        AND river_job.state IN ('available', 'running')
+    GROUP BY river_job.queue
+)
+
+SELECT
+    cast(queue AS text) AS queue,
+    count_available,
+    count_running
+FROM queue_stats
+ORDER BY queue ASC;
+
+-- name: JobCountByState :one
+SELECT count(*)
+FROM /* TEMPLATE: schema */river_job
+WHERE state = @state;
+
+-- Differs by necessity from other drivers because SQLite doesn't support
+-- `DELETE` inside CTEs so we can't delete if running but select otherwise.
+-- Instead, the driver uses a transaction to optimisticaly try a delete, but
+-- perform a subsequent fetch on a not found to return the right status.
+-- name: JobDelete :one
+DELETE
+FROM /* TEMPLATE: schema */river_job
+WHERE id = @id
+    -- Do not touch running jobs:
+    AND river_job.state != 'running'
+RETURNING *;
+
+-- name: JobDeleteBefore :execresult
+DELETE FROM /* TEMPLATE: schema */river_job
+WHERE id IN (
+    SELECT id
+    FROM /* TEMPLATE: schema */river_job
+    WHERE (
+            (state = 'cancelled' AND cast(@cancelled_do_delete AS boolean) AND finalized_at < cast(@cancelled_finalized_at_horizon AS text)) OR
+            (state = 'completed' AND cast(@completed_do_delete AS boolean) AND finalized_at < cast(@completed_finalized_at_horizon AS text)) OR
+            (state = 'discarded' AND cast(@discarded_do_delete AS boolean) AND finalized_at < cast(@discarded_finalized_at_horizon AS text))
+        )
+        AND (
+            cast(@queues_excluded_empty AS boolean)
+            OR queue NOT IN (SELECT value FROM json_each(cast(@queues_excluded AS blob)))
+        )
+        AND (
+            NOT cast(@queues_included_filter AS boolean)
+            OR queue IN (SELECT value FROM json_each(cast(@queues_included AS blob)))
+        )
+    ORDER BY id
+    LIMIT @max
+);
+
+-- name: JobDeleteMany :many
+DELETE FROM /* TEMPLATE: schema */river_job
+WHERE id IN (
+    SELECT id
+    FROM /* TEMPLATE: schema */river_job
+    WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
+        AND state != 'running'
+    ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
+    LIMIT @max
+)
+RETURNING *;
+
+-- Differs from the Postgres version in that we don't have `FOR UPDATE SKIP
+-- LOCKED`. It doesn't exist in SQLite, but more aptly, there's only one writer
+-- on SQLite at a time, so nothing else has the rows locked.
+--
+-- JSON columns can be changed out of band to text that isn't valid JSON, which
+-- makes SQLite's JSON functions fail with "malformed JSON", including the
+-- `json()` sqlc wraps each JSON column in when expanding `RETURNING *`. One
+-- such job would fail every fetch from its queue, so the columns are listed
+-- out instead, returning any value that isn't valid JSON as is, which the
+-- driver then reports as undecodable so the job's attempt can be failed.
+-- River writes these columns as JSONB blobs, so only text values are checked
+-- with `json_valid` (its flags for checking JSONB aren't supported by every
+-- SQLite implementation River runs on). Queries that handle jobs of any state,
+-- like completion and rescue, do the same, and leave invalid values in place
+-- rather than update them.
+-- name: JobGetAvailable :many
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    attempt = river_job.attempt + 1,
+    attempted_at = coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec')),
+
+    -- This is replaced in the driver to work around sqlc bugs for SQLite. See
+    -- comments there for more details.
+    attempted_by = /* TEMPLATE_BEGIN: attempted_by_clause */ attempted_by /* TEMPLATE_END */,
+
+    state = 'running'
+WHERE id IN (
+    SELECT id
+    FROM /* TEMPLATE: schema */river_job
+    WHERE
+        priority >= 0
+        AND river_job.queue = @queue
+        AND (NOT cast(@kind_filter AS boolean) OR kind IN (SELECT value FROM json_each(cast(@kind AS blob))))
+        AND scheduled_at <= coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
+        AND state = 'available'
+    ORDER BY
+        priority ASC,
+        scheduled_at ASC,
+        id ASC
+    LIMIT @max_to_lock
+)
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
+
+-- name: JobGetByID :one
+SELECT *
+FROM /* TEMPLATE: schema */river_job
+WHERE id = @id
+LIMIT 1;
+
+-- name: JobGetByIDMany :many
+SELECT *
+FROM /* TEMPLATE: schema */river_job
+WHERE id IN (sqlc.slice('id'))
+ORDER BY id;
+
+-- name: JobGetByKindMany :many
+SELECT *
+FROM /* TEMPLATE: schema */river_job
+WHERE kind IN (sqlc.slice('kind'))
+ORDER BY id;
+
+-- name: JobGetCancelRequested :many
+SELECT id
+FROM /* TEMPLATE: schema */river_job
+WHERE id IN (sqlc.slice('id'))
+    -- A malformed text value must not fail the cancellation lookup for
+    -- other jobs in the fetched batch.
+    AND (CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata)
+              THEN NULL ELSE metadata -> 'cancel_attempted_at' END) IS NOT NULL
+    AND state = 'running'
+ORDER BY id;
+
+-- Lists columns out to tolerate values that aren't valid JSON. See
+-- JobGetAvailable.
+-- name: JobGetStuck :many
+SELECT
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states
+FROM /* TEMPLATE: schema */river_job
+WHERE state = 'running'
+    AND id > @after_id
+    AND attempted_at < cast(@stuck_horizon AS text)
+ORDER BY id
+LIMIT @max;
+
+-- name: JobInsertFast :one
+INSERT INTO /* TEMPLATE: schema */river_job(
+    id,
+    args,
+    created_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+) VALUES (
+    cast(sqlc.narg('id') AS integer),
+    jsonb(@args),
+    coalesce(cast(sqlc.narg('created_at') AS text), datetime('now', 'subsec')),
+    @kind,
+    @max_attempts,
+    jsonb(@metadata),
+    @priority,
+    @queue,
+    coalesce(cast(sqlc.narg('scheduled_at') AS text), datetime('now', 'subsec')),
+    @state,
+    jsonb(@tags),
+    CASE WHEN length(cast(@unique_key AS blob)) = 0 THEN NULL ELSE @unique_key END,
+    @unique_states
+)
+ON CONFLICT (unique_key)
+    WHERE unique_key IS NOT NULL
+        AND unique_states IS NOT NULL
+        AND CASE state
+                WHEN 'available' THEN unique_states & (1 << 0)
+                WHEN 'cancelled' THEN unique_states & (1 << 1)
+                WHEN 'completed' THEN unique_states & (1 << 2)
+                WHEN 'discarded' THEN unique_states & (1 << 3)
+                WHEN 'pending'   THEN unique_states & (1 << 4)
+                WHEN 'retryable' THEN unique_states & (1 << 5)
+                WHEN 'running'   THEN unique_states & (1 << 6)
+                WHEN 'scheduled' THEN unique_states & (1 << 7)
+                ELSE 0
+            END >= 1
+    -- Something needs to be updated for a row to be returned on a conflict.
+    -- Keep the existing kind, which may differ under `ExcludeKind`.
+    DO UPDATE SET kind = river_job.kind
+RETURNING *;
+
+-- name: JobInsertFastMany :many
+INSERT INTO /* TEMPLATE: schema */river_job(
+    id,
+    args,
+    created_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+)
+SELECT
+    cast(json_extract(value, '$.id') AS integer),
+    jsonb(json_extract(value, '$.args')),
+    coalesce(cast(json_extract(value, '$.created_at') AS text), datetime('now', 'subsec')),
+    cast(json_extract(value, '$.kind') AS text),
+    cast(json_extract(value, '$.max_attempts') AS integer),
+    jsonb(json_extract(value, '$.metadata')),
+    cast(json_extract(value, '$.priority') AS integer),
+    cast(json_extract(value, '$.queue') AS text),
+    coalesce(cast(json_extract(value, '$.scheduled_at') AS text), datetime('now', 'subsec')),
+    cast(json_extract(value, '$.state') AS text),
+    jsonb(json_extract(value, '$.tags')),
+    CASE WHEN length(cast(json_extract(value, '$.unique_key') AS text)) = 0 THEN NULL ELSE unhex(cast(json_extract(value, '$.unique_key') AS text)) END,
+    nullif(cast(json_extract(value, '$.unique_states') AS integer), 0)
+FROM json_each(cast(@jobs AS blob))
+WHERE true
+ON CONFLICT (unique_key)
+    WHERE unique_key IS NOT NULL
+        AND unique_states IS NOT NULL
+        AND CASE state
+                WHEN 'available' THEN unique_states & (1 << 0)
+                WHEN 'cancelled' THEN unique_states & (1 << 1)
+                WHEN 'completed' THEN unique_states & (1 << 2)
+                WHEN 'discarded' THEN unique_states & (1 << 3)
+                WHEN 'pending'   THEN unique_states & (1 << 4)
+                WHEN 'retryable' THEN unique_states & (1 << 5)
+                WHEN 'running'   THEN unique_states & (1 << 6)
+                WHEN 'scheduled' THEN unique_states & (1 << 7)
+                ELSE 0
+            END >= 1
+    -- Something needs to be updated for a row to be returned on a conflict.
+    -- Keep the existing kind, which may differ under `ExcludeKind`.
+    DO UPDATE SET kind = river_job.kind
+RETURNING *;
+
+-- name: JobInsertFastNoReturning :execrows
+INSERT INTO /* TEMPLATE: schema */river_job(
+    args,
+    created_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+) VALUES (
+    jsonb(@args),
+    coalesce(cast(sqlc.narg('created_at') AS text), datetime('now', 'subsec')),
+    @kind,
+    @max_attempts,
+    jsonb(@metadata),
+    @priority,
+    @queue,
+    coalesce(cast(sqlc.narg('scheduled_at') AS text), datetime('now', 'subsec')),
+    @state,
+    jsonb(@tags),
+    CASE WHEN length(cast(@unique_key AS blob)) = 0 THEN NULL ELSE @unique_key END,
+    @unique_states
+)
+ON CONFLICT (unique_key)
+    WHERE unique_key IS NOT NULL
+        AND unique_states IS NOT NULL
+        AND CASE state
+                WHEN 'available' THEN unique_states & (1 << 0)
+                WHEN 'cancelled' THEN unique_states & (1 << 1)
+                WHEN 'completed' THEN unique_states & (1 << 2)
+                WHEN 'discarded' THEN unique_states & (1 << 3)
+                WHEN 'pending'   THEN unique_states & (1 << 4)
+                WHEN 'retryable' THEN unique_states & (1 << 5)
+                WHEN 'running'   THEN unique_states & (1 << 6)
+                WHEN 'scheduled' THEN unique_states & (1 << 7)
+                ELSE 0
+            END >= 1
+DO NOTHING;
+
+-- name: JobInsertFastManyNoReturning :execrows
+INSERT INTO /* TEMPLATE: schema */river_job(
+    args,
+    created_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+)
+SELECT
+    jsonb(json_extract(value, '$.args')),
+    coalesce(cast(json_extract(value, '$.created_at') AS text), datetime('now', 'subsec')),
+    cast(json_extract(value, '$.kind') AS text),
+    cast(json_extract(value, '$.max_attempts') AS integer),
+    jsonb(json_extract(value, '$.metadata')),
+    cast(json_extract(value, '$.priority') AS integer),
+    cast(json_extract(value, '$.queue') AS text),
+    coalesce(cast(json_extract(value, '$.scheduled_at') AS text), datetime('now', 'subsec')),
+    cast(json_extract(value, '$.state') AS text),
+    jsonb(json_extract(value, '$.tags')),
+    CASE WHEN length(cast(json_extract(value, '$.unique_key') AS text)) = 0 THEN NULL ELSE unhex(cast(json_extract(value, '$.unique_key') AS text)) END,
+    nullif(cast(json_extract(value, '$.unique_states') AS integer), 0)
+FROM json_each(cast(@jobs AS blob))
+WHERE true
+ON CONFLICT (unique_key)
+    WHERE unique_key IS NOT NULL
+        AND unique_states IS NOT NULL
+        AND CASE state
+                WHEN 'available' THEN unique_states & (1 << 0)
+                WHEN 'cancelled' THEN unique_states & (1 << 1)
+                WHEN 'completed' THEN unique_states & (1 << 2)
+                WHEN 'discarded' THEN unique_states & (1 << 3)
+                WHEN 'pending'   THEN unique_states & (1 << 4)
+                WHEN 'retryable' THEN unique_states & (1 << 5)
+                WHEN 'running'   THEN unique_states & (1 << 6)
+                WHEN 'scheduled' THEN unique_states & (1 << 7)
+                ELSE 0
+            END >= 1
+DO NOTHING;
+
+-- name: JobInsertFull :one
+INSERT INTO /* TEMPLATE: schema */river_job(
+    args,
+    attempt,
+    attempted_at,
+    attempted_by,
+    created_at,
+    errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+) VALUES (
+    jsonb(@args),
+    @attempt,
+    cast(sqlc.narg('attempted_at') as text),
+    CASE WHEN length(cast(@attempted_by AS blob)) = 0 THEN NULL ELSE jsonb(@attempted_by) END,
+    coalesce(cast(sqlc.narg('created_at') AS text), datetime('now', 'subsec')),
+    CASE WHEN length(cast(@errors AS blob)) = 0 THEN NULL ELSE jsonb(@errors) END,
+    cast(sqlc.narg('finalized_at') as text),
+    @kind,
+    @max_attempts,
+    jsonb(@metadata),
+    @priority,
+    @queue,
+    coalesce(cast(sqlc.narg('scheduled_at') AS text), datetime('now', 'subsec')),
+    @state,
+    jsonb(@tags),
+    CASE WHEN length(cast(@unique_key AS blob)) = 0 THEN NULL ELSE @unique_key END,
+    @unique_states
+) RETURNING *;
+
+-- name: JobInsertFullMany :many
+INSERT INTO /* TEMPLATE: schema */river_job(
+    args,
+    attempt,
+    attempted_at,
+    attempted_by,
+    created_at,
+    errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    metadata,
+    priority,
+    queue,
+    scheduled_at,
+    state,
+    tags,
+    unique_key,
+    unique_states
+)
+SELECT
+    jsonb(json_extract(value, '$.args')),
+    cast(json_extract(value, '$.attempt') AS integer),
+    cast(json_extract(value, '$.attempted_at') AS text),
+    CASE WHEN json_type(value, '$.attempted_by') IS NULL THEN NULL ELSE jsonb(json_extract(value, '$.attempted_by')) END,
+    coalesce(cast(json_extract(value, '$.created_at') AS text), datetime('now', 'subsec')),
+    CASE WHEN json_type(value, '$.errors') IS NULL THEN NULL ELSE jsonb(json_extract(value, '$.errors')) END,
+    cast(json_extract(value, '$.finalized_at') AS text),
+    cast(json_extract(value, '$.kind') AS text),
+    cast(json_extract(value, '$.max_attempts') AS integer),
+    jsonb(json_extract(value, '$.metadata')),
+    cast(json_extract(value, '$.priority') AS integer),
+    cast(json_extract(value, '$.queue') AS text),
+    coalesce(cast(json_extract(value, '$.scheduled_at') AS text), datetime('now', 'subsec')),
+    cast(json_extract(value, '$.state') AS text),
+    jsonb(json_extract(value, '$.tags')),
+    CASE WHEN length(cast(json_extract(value, '$.unique_key') AS text)) = 0 THEN NULL ELSE unhex(cast(json_extract(value, '$.unique_key') AS text)) END,
+    nullif(cast(json_extract(value, '$.unique_states') AS integer), 0)
+FROM json_each(cast(@jobs AS blob))
+RETURNING *;
+
+-- name: JobKindList :many
+SELECT DISTINCT kind
+FROM /* TEMPLATE: schema */river_job
+WHERE (cast(@match AS text) = '' OR LOWER(kind) LIKE '%' || LOWER(cast(@match AS text)) || '%')
+    AND (cast(@after AS text) = '' OR kind > cast(@after AS text))
+    AND kind NOT IN (sqlc.slice('exclude'))
+ORDER BY kind ASC
+LIMIT @max;
+
+-- name: JobList :many
+SELECT *
+FROM /* TEMPLATE: schema */river_job
+WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
+ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
+LIMIT @max;
+
+-- Rescue a job.
+--
+-- This is supposed to rescue jobs in batches, but various limitations of the
+-- combined SQLite + sqlc has left me unable to find a way of injecting many
+-- arguments en masse (like how we slightly abuse arrays to pull it off for the
+-- Postgres drivers), and SQLite doesn't support `UPDATE` in CTEs, so we loop
+-- over many insert operations instead, with the expectation that this may be
+-- fixable in the future. Because SQLite targets will often be local and with a
+-- very minimal round trip compared to a network, looping over operations is
+-- probably okay performance-wise.
+--
+-- As in JobSetStateIfRunning, an errors value that's been changed out of band
+-- is wrapped in an array so the rescue error is still appended, and metadata
+-- that isn't valid JSON is left in place.
+-- name: JobRescue :exec
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    errors = CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors)
+                  THEN jsonb(json_array(errors, json(@error)))
+                  WHEN coalesce(json_type(errors), 'array') <> 'array'
+                  THEN jsonb(json_array(json(errors), json(@error)))
+                  ELSE jsonb(json_insert(json(coalesce(errors, jsonb('[]'))), '$[#]', json(@error))) END,
+    finalized_at = cast(sqlc.narg('finalized_at') as text),
+    scheduled_at = cast(@scheduled_at AS text),
+    metadata = CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata)
+                    THEN metadata
+                    ELSE jsonb_set(
+                        metadata,
+                        '$."river:rescue_count"',
+                        coalesce(
+                            CASE json_type(metadata, '$."river:rescue_count"')
+                                WHEN 'integer' THEN json_extract(metadata, '$."river:rescue_count"')
+                                WHEN 'real' THEN json_extract(metadata, '$."river:rescue_count"')
+                            END,
+                            0
+                        ) + 1
+                    ) END,
+    state = @state
+WHERE id = @id
+    AND state = 'running'
+    AND attempted_at < cast(@stuck_horizon AS text);
+
+-- Differs by necessity from other drivers because SQLite doesn't support
+-- `UPDATE` inside CTEs so we can't retry if running but select otherwise.
+-- Instead, the driver uses a transaction to optimisticaly try an update, but
+-- perform a subsequent fetch on a not found to return the right status.
+--
+-- I had to invert the last 'AND' expression below (was an 'AND NOT') due to an
+-- sqlc bug. Something about sqlc's SQLite parser cannot detect a parameter
+-- inside an `AND NOT`. I'll try to get this fixed upstream at some point so we
+-- can clean this up and keep it more like the Postgres version.
+-- name: JobRetry :one
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    state = 'available',
+    max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+    finalized_at = NULL,
+    scheduled_at = coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
+WHERE id = @id
+    -- Do not touch running jobs:
+    AND state != 'running'
+    -- If the job is already available with a prior scheduled_at, leave it alone.
+    --
+    -- I had to invert the original 'AND NOT' to 'AND'. Something about
+    -- sqlc's SQLite parser cannot detect a parameter inside an `AND NOT`. An
+    -- unfortunate bug that will hopefully be fixed in the future ...
+    AND (
+        state <> 'available'
+        OR scheduled_at > coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
+    )
+RETURNING *;
+
+-- Selects only the columns needed to schedule jobs so that a job with a JSON
+-- column that isn't valid JSON doesn't fail scheduling. See JobGetAvailable.
+-- name: JobScheduleGetEligible :many
+SELECT id, unique_key
+FROM /* TEMPLATE: schema */river_job
+WHERE
+    state IN ('retryable', 'scheduled')
+    AND scheduled_at <= coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
+ORDER BY
+    priority,
+    scheduled_at,
+    id
+LIMIT @max;
+
+-- name: JobScheduleGetCollision :one
+SELECT id
+FROM /* TEMPLATE: schema */river_job
+WHERE id <> @id
+    AND unique_key = @unique_key
+    AND unique_states IS NOT NULL
+    AND CASE state
+            WHEN 'available' THEN unique_states & (1 << 0)
+            WHEN 'cancelled' THEN unique_states & (1 << 1)
+            WHEN 'completed' THEN unique_states & (1 << 2)
+            WHEN 'discarded' THEN unique_states & (1 << 3)
+            WHEN 'pending'   THEN unique_states & (1 << 4)
+            WHEN 'retryable' THEN unique_states & (1 << 5)
+            WHEN 'running'   THEN unique_states & (1 << 6)
+            WHEN 'scheduled' THEN unique_states & (1 << 7)
+            ELSE 0
+        END >= 1;
+
+-- Columns are listed out to tolerate values that aren't valid JSON. See
+-- JobGetAvailable.
+-- name: JobScheduleSetAvailable :many
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    state = 'available'
+WHERE id IN (sqlc.slice('id'))
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
+
+-- Metadata that isn't valid JSON is left in place, and columns are listed out
+-- to tolerate values that aren't valid JSON. See JobGetAvailable.
+-- name: JobScheduleSetDiscarded :many
+UPDATE /* TEMPLATE: schema */river_job
+SET metadata = CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata)
+                    THEN jsonb_patch(json(metadata), json('{"unique_key_conflict": "scheduler_discarded"}'))
+                    ELSE metadata END,
+    finalized_at = coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec')),
+    state = 'discarded'
+WHERE id IN (sqlc.slice('id'))
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
+
+-- This doesn't exist under the Postgres driver, but needed as an extra query
+-- for JobSetStateIfRunning to use when falling back to non-running jobs.
+-- Metadata that isn't valid JSON is left in place, and columns are listed out
+-- to tolerate values that aren't valid JSON. See JobGetAvailable.
+-- The shared metadata_merge.sql template applies top-level replacements.
+-- name: JobSetMetadataIfNotRunning :one
+UPDATE /* TEMPLATE: schema */river_job
+SET metadata = CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata)
+                    THEN /* TEMPLATE_BEGIN: metadata_merge_clause */ metadata /* TEMPLATE_END */
+                    ELSE metadata END
+WHERE id = @id
+    AND state != 'running'
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
+
+-- Differs significantly from the Postgres version in that it can't do a bulk
+-- update, and since sqlc doesn't support `UPDATE` in CTEs, we need separate
+-- queries like JobSetMetadataIfNotRunning to do the fallback work.
+--
+-- Metadata that isn't valid JSON is treated as not having
+-- `cancel_attempted_at`, and is left in place instead of being merged into.
+-- Columns are listed out to tolerate values that aren't valid JSON. See
+-- JobGetAvailable.
+-- name: JobSetStateIfRunning :one
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    -- should_cancel: (job_input.state IN ('available', 'retryable', 'scheduled') AND river_job.metadata ? 'cancel_attempted_at')
+    --
+    -- or inverted:   (cast(@state AS text) <> 'available' AND @state <> 'retryable' AND @state <> 'scheduled' OR NOT (metadata -> 'cancel_attempted_at'))
+    attempt      = CASE WHEN /* NOT should_cancel */(cast(@state AS text) <> 'available' AND @state <> 'retryable' AND @state <> 'scheduled' OR (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NULL) AND cast(@attempt_do_update AS boolean)
+                        THEN @attempt
+                        ELSE attempt END,
+    -- The errors column is always an array unless it's been changed out of
+    -- band. If it has, wrap its value in an array (as a string if it's not
+    -- valid JSON) so that the new error is still appended without losing it.
+    errors       = CASE WHEN cast(@errors_do_update AS boolean) AND typeof(errors) = 'text' AND NOT json_valid(errors)
+                        THEN jsonb(json_array(errors, json(@error)))
+                        WHEN cast(@errors_do_update AS boolean) AND coalesce(json_type(errors), 'array') <> 'array'
+                        THEN jsonb(json_array(json(errors), json(@error)))
+                        WHEN cast(@errors_do_update AS boolean)
+                        THEN jsonb(json_insert(json(coalesce(errors, jsonb('[]'))), '$[#]', json(@error)))
+                        ELSE errors END,
+    finalized_at = CASE WHEN /* should_cancel */((@state = 'available' OR @state = 'retryable' OR @state = 'scheduled') AND (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NOT NULL)
+                        THEN coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
+                        WHEN cast(@finalized_at_do_update AS boolean)
+                        THEN cast(sqlc.narg('finalized_at') AS text)
+                        ELSE finalized_at END,
+    metadata     = CASE WHEN cast(@metadata_do_merge AS boolean) AND (typeof(metadata) <> 'text' OR json_valid(metadata))
+                        THEN /* TEMPLATE_BEGIN: metadata_merge_clause */ metadata /* TEMPLATE_END */
+                        ELSE metadata END,
+    scheduled_at = CASE WHEN /* NOT should_cancel */(cast(@state AS text) <> 'available' AND @state <> 'retryable' AND @state <> 'scheduled' OR (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NULL) AND cast(@scheduled_at_do_update AS boolean)
+                        THEN cast(@scheduled_at AS text)
+                        ELSE scheduled_at END,
+    state        = CASE WHEN /* should_cancel */((@state = 'available' OR @state = 'retryable' OR @state = 'scheduled') AND (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NOT NULL)
+                        THEN 'cancelled'
+                        ELSE @state END
+WHERE id = @id
+    AND state = 'running'
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
+
+-- name: JobUpdate :one
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    metadata = CASE WHEN cast(@metadata_do_merge AS boolean) THEN /* TEMPLATE_BEGIN: metadata_merge_clause */ metadata /* TEMPLATE_END */ ELSE metadata END
+WHERE id = @id
+RETURNING *;
+
+-- A generalized update for any property on a job. This brings in a large number
+-- of parameters and therefore may be more suitable for testing than production.
+-- name: JobUpdateFull :one
+UPDATE /* TEMPLATE: schema */river_job
+SET
+    attempt = CASE WHEN cast(@attempt_do_update AS boolean) THEN @attempt ELSE attempt END,
+    attempted_at = CASE WHEN cast(@attempted_at_do_update AS boolean) THEN cast(sqlc.narg('attempted_at') AS text) ELSE attempted_at END,
+    attempted_by = CASE WHEN cast(@attempted_by_do_update AS boolean) THEN jsonb(@attempted_by) ELSE attempted_by END,
+    errors = CASE WHEN cast(@errors_do_update AS boolean) THEN jsonb(@errors) ELSE errors END,
+    finalized_at = CASE WHEN cast(@finalized_at_do_update AS boolean) THEN cast(sqlc.narg('finalized_at') AS text) ELSE finalized_at END,
+    max_attempts = CASE WHEN cast(@max_attempts_do_update AS boolean) THEN @max_attempts ELSE max_attempts END,
+    metadata = CASE WHEN cast(@metadata_do_update AS boolean) THEN jsonb(@metadata) ELSE metadata END,
+    state = CASE WHEN cast(@state_do_update AS boolean) THEN @state ELSE state END
+WHERE id = @id
+RETURNING *;

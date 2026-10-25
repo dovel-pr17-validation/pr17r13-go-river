@@ -1,0 +1,1954 @@
+// Package riversqlite provides a River driver implementation for SQLite. It's
+// also tested against libSQL (a SQLite fork) and local Turso databases.
+//
+// This driver is currently in early testing. It's exercised reasonably
+// thoroughly in the test suite, but has minimal real world use as of yet.
+//
+// River makes extensive use of internal operations that might run in parallel,
+// which doesn't naturally play well with SQLite, which only allows one
+// operation at a time, returning errors like "database is locked (5)
+// (SQLITE_BUSY)" in case another tries to access it. A good workaround to avoid
+// errors is to set the maximum pool size to one connection like
+// `dbPool.SetMaxOpenConns(1)`.
+//
+// A known deficiency in this driver compared to Postgres is that due to
+// limitations in sqlc, it performs operations like completion and `InsertMany`
+// one row at a time instead of in batches. This means that it's slower than the
+// Postgres driver, especially when benchmarking.
+package riversqlite
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"math"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/riverqueue/river/riverdriver"
+	"github.com/riverqueue/river/riverdriver/riversqlite/internal/dbsqlc"
+	"github.com/riverqueue/river/rivershared/sqlctemplate"
+	"github.com/riverqueue/river/rivershared/uniquestates"
+	"github.com/riverqueue/river/rivershared/util/dbutil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
+	"github.com/riverqueue/river/rivershared/util/savepointutil"
+	"github.com/riverqueue/river/rivershared/util/sliceutil"
+	"github.com/riverqueue/river/rivertype"
+)
+
+//go:embed migration/*/*.sql
+var migrationFS embed.FS
+
+// Driver is an implementation of riverdriver.Driver for database/sql.
+type Driver struct {
+	dbPool   *sql.DB
+	replacer sqlctemplate.Replacer
+}
+
+// New returns a new SQLite driver for use with River. It also works with libSQL
+// (a SQLite fork) and local Turso databases.
+//
+// It takes an sql.DB to use for use with River. The pool should already be
+// configured to use the schema specified in the client's Schema field. The pool
+// must not be closed while associated River objects are running.
+func New(dbPool *sql.DB) *Driver {
+	return &Driver{
+		dbPool: dbPool,
+	}
+}
+
+const argPlaceholder = "?"
+
+func (d *Driver) ArgPlaceholder() string { return argPlaceholder }
+func (d *Driver) DatabaseName() string   { return riverdriver.DatabaseNameSQLite }
+
+func (d *Driver) GetExecutor() riverdriver.Executor {
+	return &Executor{d.dbPool, templateReplaceWrapper{d.dbPool, &d.replacer}, d, nil}
+}
+
+func (d *Driver) GetListener(params *riverdriver.GetListenenerParams) riverdriver.Listener {
+	return &Listener{
+		dbPool:       d.dbPool,
+		pollInterval: notificationPollIntervalDefault,
+		replacer:     &d.replacer,
+		schema:       params.Schema,
+		topics:       make(map[string]int64),
+	}
+}
+
+func (d *Driver) GetMigrationDefaultLines() []string { return []string{riverdriver.MigrationLineMain} }
+
+func (d *Driver) GetMigrationFS(line string) fs.FS {
+	if line == riverdriver.MigrationLineMain {
+		return migrationFS
+	}
+	panic("migration line does not exist: " + line)
+}
+func (d *Driver) GetMigrationLines() []string { return []string{riverdriver.MigrationLineMain} }
+func (d *Driver) GetMigrationTruncateTables(line string, version int) []string {
+	if line == riverdriver.MigrationLineMain {
+		return riverdriver.MigrationLineMainTruncateTables(version)
+	}
+	panic("migration line does not exist: " + line)
+}
+
+func (d *Driver) PoolIsSet() bool { return d.dbPool != nil }
+func (d *Driver) PoolSet(dbPool any) error {
+	if d.dbPool != nil {
+		return errors.New("cannot PoolSet when internal pool is already non-nil")
+	}
+	d.dbPool = dbPool.(*sql.DB) //nolint:forcetypeassert
+	return nil
+}
+
+func (d *Driver) SQLFragmentColumnContainsAll(column, namedArg string, values []string) (string, any, error) {
+	arg, err := json.Marshal(values)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return fmt.Sprintf(`NOT EXISTS (
+    SELECT 1
+    FROM json_each(cast(@%s AS blob)) AS filter_value
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM json_each(%s) AS column_value
+        WHERE column_value.value = filter_value.value
+    )
+)`, namedArg, column), arg, nil
+}
+
+func (d *Driver) SQLFragmentColumnContainsAny(column, namedArg string, values []string) (string, any, error) {
+	arg, err := json.Marshal(values)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return fmt.Sprintf(`EXISTS (
+    SELECT 1
+    FROM json_each(%s) AS column_value
+    INNER JOIN json_each(cast(@%s AS blob)) AS filter_value
+        ON column_value.value = filter_value.value
+)`, column, namedArg), arg, nil
+}
+
+func (d *Driver) SQLFragmentColumnIn(column string, values any) (string, any, error) {
+	arg, err := json.Marshal(values)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return fmt.Sprintf("%s IN (SELECT value FROM json_each(cast(@%s AS blob)))", column, column), arg, nil
+}
+
+func (d *Driver) SupportsListener() bool       { return true }
+func (d *Driver) SupportsListenNotify() bool   { return true }
+func (d *Driver) TimePrecision() time.Duration { return time.Millisecond }
+
+func (d *Driver) UnwrapExecutor(tx *sql.Tx) riverdriver.ExecutorTx {
+	// Allows UnwrapExecutor to be invoked even if driver is nil.
+	var replacer *sqlctemplate.Replacer
+	if d == nil {
+		replacer = &sqlctemplate.Replacer{}
+	} else {
+		replacer = &d.replacer
+	}
+
+	executorTx := &ExecutorTx{tx: tx}
+	executorTx.Executor = Executor{nil, templateReplaceWrapper{tx, replacer}, d, executorTx}
+
+	return executorTx
+}
+
+func (d *Driver) UnwrapTx(execTx riverdriver.ExecutorTx) *sql.Tx {
+	switch execTx := execTx.(type) {
+	case *ExecutorSubTx:
+		return execTx.tx
+	case *ExecutorTx:
+		return execTx.tx
+	}
+	panic("unhandled executor type")
+}
+
+type Executor struct {
+	dbPool *sql.DB
+	dbtx   templateReplaceWrapper
+	driver *Driver
+	execTx riverdriver.ExecutorTx
+}
+
+func (e *Executor) Begin(ctx context.Context) (riverdriver.ExecutorTx, error) {
+	if e.execTx != nil {
+		return e.execTx.Begin(ctx)
+	}
+
+	conn, err := e.dbPool.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		// Turso can execute BEGIN, then report context cancellation without
+		// rolling back. Discard the connection while we still own it so an
+		// open transaction can't be returned to the pool.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		_ = conn.Close()
+		return nil, err
+	}
+
+	// database/sql rolls back on cancellation, but a transaction begun on a
+	// dedicated connection doesn't return that connection to the pool. Close
+	// it on cancellation too; Close waits for the rollback to finish.
+	stopCloseFunc := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	executorTx := &ExecutorTx{
+		releaseConnFunc: func() {
+			stopCloseFunc()
+			_ = conn.Close()
+		},
+		tx: tx,
+	}
+	executorTx.Executor = Executor{nil, templateReplaceWrapper{tx, &e.driver.replacer}, e.driver, executorTx}
+
+	return executorTx, nil
+}
+
+func (e *Executor) ColumnExists(ctx context.Context, params *riverdriver.ColumnExistsParams) (bool, error) {
+	// Unfortunately this doesn't work in sqlc because table-valued pragmas
+	// aren't supported. This seems like it should be fixable, but for now run
+	// raw SQL to accomplish it.
+	const sqlMain = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM pragma_table_info(?)
+		WHERE name = ?
+	)`
+	const sqlSchema = `
+	SELECT EXISTS (
+		SELECT 1
+		FROM pragma_table_info
+		WHERE schema = ? AND arg = ? AND name = ?
+	)`
+
+	var (
+		sql  = sqlMain
+		args = []any{params.Table, params.Column}
+	)
+	if params.Schema != "" && params.Schema != "main" {
+		sql = sqlSchema
+		args = []any{params.Schema, params.Table, params.Column}
+	}
+
+	var exists int64
+	if err := e.dbtx.QueryRowContext(ctx, sql, args...).Scan(&exists); err != nil {
+		return false, interpretError(err)
+	}
+
+	return exists > 0, nil
+}
+
+func (e *Executor) Exec(ctx context.Context, sql string, args ...any) error {
+	_, err := e.dbtx.ExecContext(ctx, sql, args...)
+	return interpretError(err)
+}
+
+func (e *Executor) IndexDropIfExists(ctx context.Context, params *riverdriver.IndexDropIfExistsParams) error {
+	var maybeSchema string
+	if params.Schema != "" {
+		maybeSchema = dbutil.SafeIdentifier(params.Schema) + "."
+	}
+
+	_, err := e.dbtx.ExecContext(ctx, "DROP INDEX IF EXISTS "+maybeSchema+dbutil.SafeIdentifier(params.Index))
+	return interpretError(err)
+}
+
+func (e *Executor) IndexExists(ctx context.Context, params *riverdriver.IndexExistsParams) (bool, error) {
+	exists, err := dbsqlc.New().IndexExists(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Index)
+	return exists, interpretError(err)
+}
+
+func (e *Executor) IndexReindex(ctx context.Context, params *riverdriver.IndexReindexParams) error {
+	var maybeSchema string
+	if params.Schema != "" {
+		maybeSchema = dbutil.SafeIdentifier(params.Schema) + "."
+	}
+
+	_, err := e.dbtx.ExecContext(ctx, "REINDEX "+maybeSchema+dbutil.SafeIdentifier(params.Index))
+	return interpretError(err)
+}
+
+func (e *Executor) IndexReindexArtifacts(ctx context.Context, params *riverdriver.IndexReindexArtifactsParams) ([]string, error) {
+	return nil, nil
+}
+
+func (e *Executor) IndexesExist(ctx context.Context, params *riverdriver.IndexesExistParams) (map[string]bool, error) {
+	exists := make(map[string]bool)
+	for _, index := range params.IndexNames {
+		indexExists, err := e.IndexExists(ctx, &riverdriver.IndexExistsParams{
+			Index:  index,
+			Schema: params.Schema,
+		})
+		if err != nil {
+			return nil, err
+		}
+		exists[index] = indexExists
+	}
+
+	return exists, nil
+}
+
+func (e *Executor) InitDriver(context.Context) error { return nil }
+
+func (e *Executor) JobCancel(ctx context.Context, params *riverdriver.JobCancelParams) (*rivertype.JobRow, error) {
+	// Unlike Postgres, this must be carried out in two operations because
+	// SQLite doesn't support CTEs containing `UPDATE`. As long as the job
+	// exists and is not running, only one database operation is needed, but if
+	// the initial update comes back empty, it does one more fetch to return the
+	// most appropriate error.
+	return dbutil.WithTxV(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) (*rivertype.JobRow, error) { // TODO
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		cancelledAt, err := params.CancelAttemptedAt.UTC().MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		cancelledAt = cancelledAt[1 : len(cancelledAt)-1] // remove quotes around the time so we don't end up with doubled up quotes
+
+		job, err := dbsqlc.New().JobCancel(schemaTemplateParam(ctx, params.Schema), dbtx, &dbsqlc.JobCancelParams{
+			ID:                params.ID,
+			CancelAttemptedAt: string(cancelledAt),
+			Now:               timeStringNullable(params.Now),
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				job, err := execTx.JobGetByID(ctx, &riverdriver.JobGetByIDParams{
+					ID:     params.ID,
+					Schema: params.Schema,
+				})
+				if err != nil {
+					return nil, interpretError(err)
+				}
+				return job, nil
+			}
+
+			return nil, interpretError(err)
+		}
+		if params.ControlTopic != "" {
+			if err := dbsqlc.New().NotificationInsertJobCancel(schemaTemplateParam(ctx, params.Schema), dbtx, &dbsqlc.NotificationInsertJobCancelParams{
+				JobID: job.ID,
+				Queue: job.Queue,
+				Topic: params.ControlTopic,
+			}); err != nil {
+				return nil, fmt.Errorf("error inserting job cancellation notification: %w", interpretError(err))
+			}
+		}
+		return jobRowFromInternal(job)
+	})
+}
+
+func (e *Executor) JobCountByAllStates(ctx context.Context, params *riverdriver.JobCountByAllStatesParams) (map[rivertype.JobState]int, error) {
+	counts, err := dbsqlc.New().JobCountByAllStates(schemaTemplateParam(ctx, params.Schema), e.dbtx)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	countsMap := make(map[rivertype.JobState]int)
+	for _, state := range rivertype.JobStates() {
+		countsMap[state] = 0
+	}
+	for _, count := range counts {
+		countsMap[rivertype.JobState(count.State)] = int(count.Count)
+	}
+	return countsMap, nil
+}
+
+func (e *Executor) JobCountByQueueAndState(ctx context.Context, params *riverdriver.JobCountByQueueAndStateParams) ([]*riverdriver.JobCountByQueueAndStateResult, error) {
+	rows, err := dbsqlc.New().JobCountByQueueAndState(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.QueueNames)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	// The Postgres drivers implement this query with an `all_queues` CTE and
+	// LEFT JOINs, so they return one row per requested queue, including queues
+	// that currently have no jobs. The input queue list is deduplicated in SQL.
+	// The SQLite sqlc driver only reliably supports `sqlc.slice` in `IN (...)`,
+	// and we haven't found a workable way to bind a parameterized list through
+	// `json_each(...)` to produce equivalent SQL. The SQLite SQL query therefore
+	// returns only queues with matching rows, and this wrapper fills in missing
+	// queues to match Postgres behavior.
+	countsByQueue := make(map[string]struct {
+		CountAvailable int64
+		CountRunning   int64
+	}, len(rows))
+	for _, row := range rows {
+		countsByQueue[row.Queue] = struct {
+			CountAvailable int64
+			CountRunning   int64
+		}{
+			CountAvailable: row.CountAvailable,
+			CountRunning:   row.CountRunning,
+		}
+	}
+
+	queueNames := slices.Clone(params.QueueNames)
+	slices.Sort(queueNames)
+	queueNames = slices.Compact(queueNames)
+
+	results := make([]*riverdriver.JobCountByQueueAndStateResult, 0, len(queueNames))
+	for _, queueName := range queueNames {
+		result := &riverdriver.JobCountByQueueAndStateResult{
+			Queue: queueName,
+		}
+		if counts, ok := countsByQueue[queueName]; ok {
+			result.CountAvailable = counts.CountAvailable
+			result.CountRunning = counts.CountRunning
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+func (e *Executor) JobCountByState(ctx context.Context, params *riverdriver.JobCountByStateParams) (int, error) {
+	numJobs, err := dbsqlc.New().JobCountByState(schemaTemplateParam(ctx, params.Schema), e.dbtx, string(params.State))
+	if err != nil {
+		return 0, err
+	}
+	return int(numJobs), nil
+}
+
+func (e *Executor) JobDelete(ctx context.Context, params *riverdriver.JobDeleteParams) (*rivertype.JobRow, error) {
+	// Unlike Postgres, this must be carried out in two operations because
+	// SQLite doesn't support CTEs containing `DELETE`. As long as the job
+	// exists and is not running, only one database operation is needed, but if
+	// the initial delete comes back empty, it does one more fetch to return the
+	// most appropriate error.
+	return dbutil.WithTxV(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) (*rivertype.JobRow, error) { // TODO
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		job, err := dbsqlc.New().JobDelete(schemaTemplateParam(ctx, params.Schema), dbtx, params.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				job, err := execTx.JobGetByID(ctx, (*riverdriver.JobGetByIDParams)(params))
+				if err != nil {
+					return nil, err
+				}
+				if job.State == rivertype.JobStateRunning {
+					return nil, rivertype.ErrJobRunning
+				}
+				return nil, fmt.Errorf("bug; expected only to fetch a job with state %q, but was: %q", rivertype.JobStateRunning, job.State)
+			}
+
+			return nil, interpretError(err)
+		}
+		return jobRowFromInternal(job)
+	})
+}
+
+func (e *Executor) JobDeleteBefore(ctx context.Context, params *riverdriver.JobDeleteBeforeParams) (int, error) {
+	queuesExcludedJSON, err := json.Marshal(params.QueuesExcluded)
+	if err != nil {
+		return 0, err
+	}
+	queuesIncludedJSON, err := json.Marshal(params.QueuesIncluded)
+	if err != nil {
+		return 0, err
+	}
+
+	res, err := dbsqlc.New().JobDeleteBefore(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobDeleteBeforeParams{
+		CancelledDoDelete:           params.CancelledDoDelete,
+		CancelledFinalizedAtHorizon: timeString(params.CancelledFinalizedAtHorizon),
+		CompletedDoDelete:           params.CompletedDoDelete,
+		CompletedFinalizedAtHorizon: timeString(params.CompletedFinalizedAtHorizon),
+		DiscardedDoDelete:           params.DiscardedDoDelete,
+		DiscardedFinalizedAtHorizon: timeString(params.DiscardedFinalizedAtHorizon),
+		Max:                         int64(params.Max),
+		QueuesExcluded:              queuesExcludedJSON,
+		QueuesExcludedEmpty:         len(params.QueuesExcluded) == 0,
+		QueuesIncluded:              queuesIncludedJSON,
+		QueuesIncludedFilter:        params.QueuesIncluded != nil,
+	})
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return int(rowsAffected), nil
+}
+
+func (e *Executor) JobDeleteMany(ctx context.Context, params *riverdriver.JobDeleteManyParams) ([]*rivertype.JobRow, error) {
+	ctx = sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"order_by_clause": {Value: params.OrderByClause},
+		"where_clause":    {Value: params.WhereClause},
+	}, params.NamedArgs)
+
+	jobs, err := dbsqlc.New().JobDeleteMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, int64(params.Max))
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	// This is unfortunate. SQLite doesn't support `DELETE` in CTEs, so there's
+	// no way to get reliable ordering back. It has a non-standard `ORDER BY`
+	// statement in `DELETE`, but this is only used to determine what fits
+	// inside `LIMIT`, and again not guaranteed to be the order returned by
+	// `RETURNING`. Here, order post-operation before returning from driver.
+	slices.SortFunc(jobs, func(j1, j2 *dbsqlc.RiverJob) int { return int(j1.ID - j2.ID) })
+	return sliceutil.MapError(jobs, jobRowFromInternal)
+}
+
+// This really sucks, but this SQL fragment's been extracted to a string because
+// sqlc is buggy and can't parse it.
+//
+// The SQL appends a new `attempted_by` to a job's `attempted_by` array (a jsonb
+// array), which in SQLite is really quite difficult to because there aren't
+// any arrays or array functions. I tried every version of this in sqlc I could
+// come up with, but there was a bug in every direction that blocked it. e.g.
+//
+//   - This version almost works, but as soon as you add a subselect like `FROM (
+//     ... )`, SQLite bugs out and can't handle it.
+//
+//   - I tried putting it in a CTE, but this is paired with an `UPDATE` statement,
+//     and `UPDATE ... FROM` isn't support in sqlc for SQLite.
+//
+// I'm really hoping this could be fixed one day by bringing it back in with
+// the rest of the job definitions, but it'll require some sqlc fixes for that
+// to work. Frustratingly, some of these fixes actually exist already [1], but
+// just can't be merged/release due to bottlenecks in the sqlc project.
+//
+// [1] https://github.com/sqlc-dev/sqlc/pull/3610
+//
+// An `attempted_by` that's been changed out of band to a value that isn't
+// valid JSON is left in place instead, because `json_each` would fail on it
+// and with it the whole fetch. The job is then returned as undecodable. The
+// value is also kept from `json_each` in the subquery because Turso evaluates
+// the subquery even when the `CASE` branch containing it isn't taken.
+//
+//nolint:gochecknoglobals
+var jobGetAvailableAttemptedBySQL = strings.TrimSpace(`
+    CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE
+    jsonb(json_insert(
+        (
+            SELECT jsonb_group_array(value)
+            FROM (
+                SELECT *
+                FROM (
+                    SELECT *
+                    FROM json_each(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN jsonb('[]') ELSE coalesce(attempted_by, jsonb('[]')) END)
+                    ORDER BY key DESC
+                    LIMIT @max_attempted_by - 1
+                )
+                ORDER BY key
+            )
+        ),
+        '$[#]',
+        @attempted_by
+    ))
+    END
+`)
+
+func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobGetAvailableParams) (*riverdriver.JobGetAvailableResult, error) {
+	kindsJSON, err := json.Marshal(params.Kind)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"attempted_by_clause": {
+			Stable: true, // input never changes
+			Value:  jobGetAvailableAttemptedBySQL,
+		},
+	}, map[string]any{
+		"attempted_by":     params.ClientID,
+		"max_attempted_by": params.MaxAttemptedBy,
+	})
+
+	jobs, err := dbsqlc.New().JobGetAvailable(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableParams{
+		Kind:       kindsJSON,
+		KindFilter: params.Kind != nil,
+		MaxToLock:  int64(params.MaxToLock),
+		Now:        timeStringNullable(params.Now),
+		Queue:      params.Queue,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobGetAvailableResultFromInternal(sliceutil.Map(jobs, jobFromReturningRow)), nil
+}
+
+func (e *Executor) JobGetByID(ctx context.Context, params *riverdriver.JobGetByIDParams) (*rivertype.JobRow, error) {
+	job, err := dbsqlc.New().JobGetByID(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.ID)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(job)
+}
+
+func (e *Executor) JobGetByIDMany(ctx context.Context, params *riverdriver.JobGetByIDManyParams) ([]*rivertype.JobRow, error) {
+	jobs, err := dbsqlc.New().JobGetByIDMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.ID)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.MapError(jobs, jobRowFromInternal)
+}
+
+func (e *Executor) JobGetByKindMany(ctx context.Context, params *riverdriver.JobGetByKindManyParams) ([]*rivertype.JobRow, error) {
+	jobs, err := dbsqlc.New().JobGetByKindMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Kind)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.MapError(jobs, jobRowFromInternal)
+}
+
+func (e *Executor) JobGetCancelRequested(ctx context.Context, params *riverdriver.JobGetCancelRequestedParams) ([]int64, error) {
+	ids, err := dbsqlc.New().JobGetCancelRequested(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.ID)
+	return ids, interpretError(err)
+}
+
+func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
+	jobs, err := dbsqlc.New().JobGetStuck(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetStuckParams{
+		AfterID:      params.AfterID,
+		Max:          int64(params.Max),
+		StuckHorizon: timeString(params.StuckHorizon),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowsFromInternalPartial(sliceutil.Map(jobs, func(job *dbsqlc.JobGetStuckRow) *dbsqlc.RiverJob {
+		return (*dbsqlc.RiverJob)(job)
+	})), nil
+}
+
+func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
+	// We use a special `(xmax != 0)` trick in Postgres to determine whether an
+	// upserted row was inserted or skipped, but as far as I can find, there's no
+	// such trick possible in SQLite. Instead, we insert a random nonce into
+	// each row's metadata. A returned nonce from this batch identifies an
+	// inserted row; another nonce identifies an existing row.
+	uniqueNonces := make([]string, len(params.Jobs))
+	uniqueNoncesInBatch := make(map[string]bool, len(params.Jobs))
+	uniqueKeysInBatch := make(map[string]bool, len(params.Jobs))
+	for i, job := range params.Jobs {
+		// Postgres rejects a statement that affects the same unique row twice.
+		// SQLite allows it, so reject repeated keys covered by the unique index.
+		if len(job.UniqueKey) > 0 && job.UniqueStates&uniquestates.UniqueStatesToBitmask([]rivertype.JobState{job.State}) != 0 {
+			key := string(job.UniqueKey)
+			if uniqueKeysInBatch[key] {
+				return nil, errors.New("unique key appears more than once in batch")
+			}
+			uniqueKeysInBatch[key] = true
+		}
+
+		uniqueNonces[i] = randutil.Hex(8)
+		uniqueNoncesInBatch[uniqueNonces[i]] = true
+	}
+
+	jobsParam, err := sqliteJobInsertFastManyJobsParam(params.Jobs, uniqueNonces)
+	if err != nil {
+		return nil, err
+	}
+
+	jobs, err := dbsqlc.New().JobInsertFastMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, jobsParam)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	return sliceutil.MapError(jobs, func(internal *dbsqlc.RiverJob) (*riverdriver.JobInsertFastResult, error) {
+		job, err := jobRowFromInternal(internal)
+		if err != nil {
+			return nil, err
+		}
+		returnedNonce, hasNonce := riverdriver.UniqueInsertMetadataNonce(job.Metadata)
+
+		return &riverdriver.JobInsertFastResult{
+			Job:                      job,
+			UniqueSkippedAsDuplicate: !hasNonce || !uniqueNoncesInBatch[returnedNonce],
+		}, nil
+	})
+}
+
+func (e *Executor) JobInsertFastManyNoReturning(ctx context.Context, params *riverdriver.JobInsertFastManyParams) (int, error) {
+	jobsParam, err := sqliteJobInsertFastManyJobsParam(params.Jobs, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	numInserted, err := dbsqlc.New().JobInsertFastManyNoReturning(schemaTemplateParam(ctx, params.Schema), e.dbtx, jobsParam)
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return int(numInserted), nil
+}
+
+func (e *Executor) JobInsertFull(ctx context.Context, params *riverdriver.JobInsertFullParams) (*rivertype.JobRow, error) {
+	var attemptedBy []byte
+	if params.AttemptedBy != nil {
+		var err error
+		attemptedBy, err = json.Marshal(params.AttemptedBy)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var errors []byte
+	if len(params.Errors) > 0 {
+		var err error
+		errors, err = json.Marshal(sliceutil.Map(params.Errors, func(e []byte) json.RawMessage { return json.RawMessage(e) }))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	tags, err := json.Marshal(params.Tags)
+	if err != nil {
+		return nil, err
+	}
+
+	var uniqueStates *int64
+	if params.UniqueStates != 0 {
+		uniqueStates = new(int64(params.UniqueStates))
+	}
+
+	job, err := dbsqlc.New().JobInsertFull(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobInsertFullParams{
+		Attempt:      int64(params.Attempt),
+		AttemptedAt:  timeStringNullable(params.AttemptedAt),
+		AttemptedBy:  attemptedBy,
+		Args:         params.EncodedArgs,
+		CreatedAt:    timeStringNullable(params.CreatedAt),
+		Errors:       errors,
+		FinalizedAt:  timeStringNullable(params.FinalizedAt),
+		Kind:         params.Kind,
+		MaxAttempts:  int64(params.MaxAttempts),
+		Metadata:     sliceutil.FirstNonEmpty(params.Metadata, []byte("{}")),
+		Priority:     int64(params.Priority),
+		Queue:        params.Queue,
+		ScheduledAt:  timeStringNullable(params.ScheduledAt),
+		State:        string(params.State),
+		Tags:         tags,
+		UniqueKey:    params.UniqueKey,
+		UniqueStates: uniqueStates,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(job)
+}
+
+func (e *Executor) JobInsertFullMany(ctx context.Context, params *riverdriver.JobInsertFullManyParams) ([]*rivertype.JobRow, error) {
+	jobsParam, err := sqliteJobInsertFullManyJobsParam(params.Jobs)
+	if err != nil {
+		return nil, err
+	}
+
+	jobs, err := dbsqlc.New().JobInsertFullMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, jobsParam)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.MapError(jobs, jobRowFromInternal)
+}
+
+func (e *Executor) JobKindList(ctx context.Context, params *riverdriver.JobKindListParams) ([]string, error) {
+	exclude := params.Exclude
+	if len(exclude) == 0 {
+		exclude = []string{""}
+	}
+
+	kinds, err := dbsqlc.New().JobKindList(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobKindListParams{
+		After:   params.After,
+		Exclude: exclude,
+		Match:   params.Match,
+		Max:     int64(min(params.Max, math.MaxInt32)),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return kinds, nil
+}
+
+func (e *Executor) JobList(ctx context.Context, params *riverdriver.JobListParams) ([]*rivertype.JobRow, error) {
+	// List cursors and custom conditions can contain time values. Bind them
+	// in the same format as stored timestamps so comparisons work in SQLite.
+	// Keep the caller's arguments intact for repeated or concurrent use.
+	namedArgs := maps.Clone(params.NamedArgs)
+	for name, arg := range namedArgs {
+		switch arg := arg.(type) {
+		case time.Time:
+			namedArgs[name] = timeString(arg)
+		case *time.Time:
+			namedArgs[name] = timeStringNullable(arg)
+		}
+	}
+
+	ctx = sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"order_by_clause": {Value: params.OrderByClause},
+		"where_clause":    {Value: params.WhereClause},
+	}, namedArgs)
+
+	jobs, err := dbsqlc.New().JobList(schemaTemplateParam(ctx, params.Schema), e.dbtx, int64(params.Max))
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.MapError(jobs, jobRowFromInternal)
+}
+
+func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
+	if err := dbutil.WithTx(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) error {
+		ctx = schemaTemplateParam(ctx, params.Schema)
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		// Should be a batch rescue, but that's currently impossible with SQLite/sqlc. https://github.com/sqlc-dev/sqlc/issues/3802
+		for i := range params.ID {
+			if err := dbsqlc.New().JobRescue(ctx, dbtx, &dbsqlc.JobRescueParams{
+				ID:           params.ID[i],
+				Error:        params.Error[i],
+				FinalizedAt:  timeStringNullable(params.FinalizedAt[i]),
+				ScheduledAt:  timeString(params.ScheduledAt[i]),
+				State:        params.State[i],
+				StuckHorizon: timeString(params.StuckHorizon),
+			}); err != nil {
+				return interpretError(err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return &struct{}{}, nil
+}
+
+func (e *Executor) JobRetry(ctx context.Context, params *riverdriver.JobRetryParams) (*rivertype.JobRow, error) {
+	// Unlike Postgres, this must be carried out in two operations because
+	// SQLite doesn't support CTEs containing `UPDATE`. As long as the job
+	// exists and is not running, only one database operation is needed, but if
+	// the initial update comes back empty, it does one more fetch to return the
+	// most appropriate error.
+	return dbutil.WithTxV(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) (*rivertype.JobRow, error) {
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		job, err := dbsqlc.New().JobRetry(schemaTemplateParam(ctx, params.Schema), dbtx, &dbsqlc.JobRetryParams{
+			ID:  params.ID,
+			Now: timeStringNullable(params.Now),
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				job, err := execTx.JobGetByID(ctx, &riverdriver.JobGetByIDParams{
+					ID:     params.ID,
+					Schema: params.Schema,
+				})
+				if err != nil {
+					return nil, interpretError(err)
+				}
+				return job, nil
+			}
+
+			return nil, interpretError(err)
+		}
+		return jobRowFromInternal(job)
+	})
+}
+
+func (e *Executor) JobSchedule(ctx context.Context, params *riverdriver.JobScheduleParams) ([]*riverdriver.JobScheduleResult, error) {
+	// This operation diverges the most from the Postgres version out of all the
+	// others by far. The Postgres version is one gigantic query that can't
+	// reproduce here because (1) SQLite doesn't support `UPDATE` in CTEs, and
+	// (2) sqlc's handling around any kind of bulk upsert mechanisms (i.e. via
+	// arrays, which don't exist, or jsonb) is completely non-functional.
+	//
+	// Instead, we break the operation up into four much smaller queries. Each
+	// query is mostly trivial, so this does have the effect of simplifying
+	// things conceptually by quite a lot. It is more Go code though, and one
+	// could argue that it's not as concurrently safe as the single query
+	// version (i.e. an advisory lock should maybe be taken around when checking
+	// rows to avoid non-repeatable read anomalies), but since only one writer
+	// at a time is possible for SQLite, this should be okay.
+	return dbutil.WithTxV(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) ([]*riverdriver.JobScheduleResult, error) {
+		ctx = schemaTemplateParam(ctx, params.Schema)
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		eligibleJobs, err := dbsqlc.New().JobScheduleGetEligible(schemaTemplateParam(ctx, params.Schema), dbtx, &dbsqlc.JobScheduleGetEligibleParams{
+			Max: int64(params.Max),
+			Now: timeStringNullable(params.Now),
+		})
+		if err != nil {
+			return nil, interpretError(err)
+		}
+
+		var (
+			discardIDs      []int64
+			nonUniqueIDs    []int64
+			scheduledResMap = make(map[int64]*riverdriver.JobScheduleResult)
+		)
+
+		// A job whose row can't be fully decoded is still returned (with the
+		// undecodable fields left empty) so that it doesn't fail scheduling
+		// for every other job. A job whose attempt fails because its row
+		// can't be decoded is retried, so its row comes through here.
+		scheduledJobRow := func(row *dbsqlc.JobGetAvailableRow) *rivertype.JobRow {
+			job, _ := jobRowFromInternalPartial(jobFromReturningRow(row))
+			return job
+		}
+
+		for _, eligibleJob := range eligibleJobs {
+			if eligibleJob.UniqueKey == nil {
+				nonUniqueIDs = append(nonUniqueIDs, eligibleJob.ID)
+				continue
+			}
+
+			collidingID, err := dbsqlc.New().JobScheduleGetCollision(ctx, dbtx, &dbsqlc.JobScheduleGetCollisionParams{
+				ID:        eligibleJob.ID,
+				UniqueKey: eligibleJob.UniqueKey,
+			})
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, interpretError(err)
+			}
+
+			if collidingID != 0 {
+				discardIDs = append(discardIDs, eligibleJob.ID)
+				continue
+			}
+
+			// We must set available immediately rather than in the batch below
+			// because it's possible for eligible jobs to be unique conflicting
+			// with each other. So when we start this loop two jobs could be
+			// scheduled with no unique collision, but after the first one is
+			// scheduled, then the second one no longer can and is discarded.
+			updatedJobs, err := dbsqlc.New().JobScheduleSetAvailable(ctx, dbtx, []int64{eligibleJob.ID})
+			if err != nil {
+				return nil, interpretError(err)
+			}
+			updatedJob := scheduledJobRow((*dbsqlc.JobGetAvailableRow)(updatedJobs[0]))
+			scheduledResMap[updatedJob.ID] = &riverdriver.JobScheduleResult{Job: *updatedJob}
+		}
+
+		if len(discardIDs) > 0 {
+			updatedJobs, err := dbsqlc.New().JobScheduleSetDiscarded(ctx, dbtx, &dbsqlc.JobScheduleSetDiscardedParams{
+				ID:  discardIDs,
+				Now: timeStringNullable(params.Now),
+			})
+			if err != nil {
+				return nil, interpretError(err)
+			}
+
+			for _, row := range updatedJobs {
+				updatedJob := scheduledJobRow((*dbsqlc.JobGetAvailableRow)(row))
+				scheduledResMap[updatedJob.ID] = &riverdriver.JobScheduleResult{ConflictDiscarded: true, Job: *updatedJob}
+			}
+		}
+
+		if len(nonUniqueIDs) > 0 {
+			updatedJobs, err := dbsqlc.New().JobScheduleSetAvailable(ctx, dbtx, nonUniqueIDs)
+			if err != nil {
+				return nil, interpretError(err)
+			}
+
+			for _, row := range updatedJobs {
+				updatedJob := scheduledJobRow((*dbsqlc.JobGetAvailableRow)(row))
+				scheduledResMap[updatedJob.ID] = &riverdriver.JobScheduleResult{Job: *updatedJob}
+			}
+		}
+
+		// Return jobs in the same order we fetched them.
+		return sliceutil.Map(eligibleJobs, func(eligibleJob *dbsqlc.JobScheduleGetEligibleRow) *riverdriver.JobScheduleResult {
+			return scheduledResMap[eligibleJob.ID]
+		}), nil
+	})
+}
+
+func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	setRes := make([]*rivertype.JobRow, 0, len(params.ID))
+
+	if err := dbutil.WithTx(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) error {
+		dbtx := templateReplaceWrapper{dbtx: e.driver.UnwrapTx(execTx), replacer: &e.driver.replacer}
+
+		// Should be a batch update, but that's currently impossible with SQLite/sqlc. https://github.com/sqlc-dev/sqlc/issues/3802
+		for i := range params.ID {
+			// Bind this job's metadata updates to the shared merge expression.
+			ctx := metadataMergeTemplateParam(schemaTemplateParam(ctx, params.Schema), params.MetadataUpdates[i])
+
+			setStateParams := &dbsqlc.JobSetStateIfRunningParams{
+				ID:    params.ID[i],
+				Error: []byte("{}"), // even if not used, must be valid JSON because it's bed into the `json` function
+				Now:   timeStringNullable(params.Now),
+				State: string(params.State[i]),
+			}
+
+			if params.Attempt[i] != nil {
+				setStateParams.AttemptDoUpdate = true
+				setStateParams.Attempt = int64(*params.Attempt[i])
+			}
+			if params.ErrData[i] != nil {
+				setStateParams.ErrorsDoUpdate = true
+				setStateParams.Error = params.ErrData[i]
+			}
+			if params.FinalizedAt[i] != nil {
+				setStateParams.FinalizedAtDoUpdate = true
+				setStateParams.FinalizedAt = timeStringNullable(params.FinalizedAt[i])
+			}
+			if params.MetadataDoMerge[i] {
+				setStateParams.MetadataDoMerge = true
+			}
+			if params.ScheduledAt[i] != nil {
+				setStateParams.ScheduledAtDoUpdate = true
+				setStateParams.ScheduledAt = timeString(*params.ScheduledAt[i])
+			}
+
+			row, err := dbsqlc.New().JobSetStateIfRunning(ctx, dbtx, setStateParams)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					var metadataRow *dbsqlc.JobSetMetadataIfNotRunningRow
+					metadataRow, err = dbsqlc.New().JobSetMetadataIfNotRunning(ctx, dbtx, params.ID[i])
+					if err != nil {
+						if errors.Is(err, sql.ErrNoRows) {
+							continue
+						}
+
+						return fmt.Errorf("error setting job metadata: %w", err)
+					}
+					row = (*dbsqlc.JobSetStateIfRunningRow)(metadataRow)
+				} else {
+					return fmt.Errorf("error setting job state: %w", err)
+				}
+			}
+			// A job whose row can't be fully decoded is still returned (with
+			// the undecodable fields left empty) so that it doesn't roll back
+			// the state change for every other job in the batch.
+			jobRow, _ := jobRowFromInternalPartial(jobFromReturningRow((*dbsqlc.JobGetAvailableRow)(row)))
+			setRes = append(setRes, jobRow)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return setRes, nil
+}
+
+func (e *Executor) JobUpdate(ctx context.Context, params *riverdriver.JobUpdateParams) (*rivertype.JobRow, error) {
+	ctx = metadataMergeTemplateParam(schemaTemplateParam(ctx, params.Schema), params.Metadata)
+
+	job, err := dbsqlc.New().JobUpdate(ctx, e.dbtx, &dbsqlc.JobUpdateParams{
+		ID:              params.ID,
+		MetadataDoMerge: params.MetadataDoMerge,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	return jobRowFromInternal(job)
+}
+
+func (e *Executor) JobUpdateFull(ctx context.Context, params *riverdriver.JobUpdateFullParams) (*rivertype.JobRow, error) {
+	attemptedBy, err := json.Marshal(params.AttemptedBy)
+	if err != nil {
+		return nil, err
+	}
+
+	errors, err := json.Marshal(sliceutil.Map(params.Errors, func(e []byte) json.RawMessage { return json.RawMessage(e) }))
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := params.Metadata
+	if metadata == nil {
+		metadata = []byte("{}")
+	}
+
+	job, err := dbsqlc.New().JobUpdateFull(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobUpdateFullParams{
+		ID:                  params.ID,
+		Attempt:             int64(params.Attempt),
+		AttemptDoUpdate:     params.AttemptDoUpdate,
+		AttemptedAt:         timeStringNullable(params.AttemptedAt),
+		AttemptedAtDoUpdate: params.AttemptedAtDoUpdate,
+		AttemptedBy:         attemptedBy,
+		AttemptedByDoUpdate: params.AttemptedByDoUpdate,
+		ErrorsDoUpdate:      params.ErrorsDoUpdate,
+		Errors:              errors,
+		FinalizedAtDoUpdate: params.FinalizedAtDoUpdate,
+		FinalizedAt:         timeStringNullable(params.FinalizedAt),
+		MaxAttemptsDoUpdate: params.MaxAttemptsDoUpdate,
+		MaxAttempts:         int64(min(params.MaxAttempts, math.MaxInt64)),
+		MetadataDoUpdate:    params.MetadataDoUpdate,
+		Metadata:            metadata,
+		StateDoUpdate:       params.StateDoUpdate,
+		State:               string(params.State),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+
+	return jobRowFromInternal(job)
+}
+
+func (e *Executor) LeaderAttemptElect(ctx context.Context, params *riverdriver.LeaderElectParams) (*riverdriver.Leader, error) {
+	leader, err := dbsqlc.New().LeaderAttemptElect(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.LeaderAttemptElectParams{
+		LeaderID: params.LeaderID,
+		Now:      timeStringNullable(params.Now),
+		TTL:      durationAsString(params.TTL),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return leaderFromInternal(leader), nil
+}
+
+func (e *Executor) LeaderAttemptReelect(ctx context.Context, params *riverdriver.LeaderReelectParams) (*riverdriver.Leader, error) {
+	leader, err := dbsqlc.New().LeaderAttemptReelect(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.LeaderAttemptReelectParams{
+		ElectedAt: timeString(params.ElectedAt),
+		LeaderID:  params.LeaderID,
+		Now:       timeStringNullable(params.Now),
+		TTL:       durationAsString(params.TTL),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return leaderFromInternal(leader), nil
+}
+
+func (e *Executor) LeaderDeleteExpired(ctx context.Context, params *riverdriver.LeaderDeleteExpiredParams) (int, error) {
+	numDeleted, err := dbsqlc.New().LeaderDeleteExpired(schemaTemplateParam(ctx, params.Schema), e.dbtx, timeStringNullable(params.Now))
+	if err != nil {
+		return 0, interpretError(err)
+	}
+	return int(numDeleted), nil
+}
+
+func (e *Executor) LeaderGetElectedLeader(ctx context.Context, params *riverdriver.LeaderGetElectedLeaderParams) (*riverdriver.Leader, error) {
+	leader, err := dbsqlc.New().LeaderGetElectedLeader(schemaTemplateParam(ctx, params.Schema), e.dbtx)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return leaderFromInternal(leader), nil
+}
+
+func (e *Executor) LeaderInsert(ctx context.Context, params *riverdriver.LeaderInsertParams) (*riverdriver.Leader, error) {
+	leader, err := dbsqlc.New().LeaderInsert(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.LeaderInsertParams{
+		ElectedAt: timeStringNullable(params.ElectedAt),
+		ExpiresAt: timeStringNullable(params.ExpiresAt),
+		Now:       timeStringNullable(params.Now),
+		LeaderID:  params.LeaderID,
+		TTL:       durationAsString(params.TTL),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return leaderFromInternal(leader), nil
+}
+
+func (e *Executor) LeaderResign(ctx context.Context, params *riverdriver.LeaderResignParams) (bool, error) {
+	numResigned, err := dbsqlc.New().LeaderResign(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.LeaderResignParams{
+		ElectedAt: timeString(params.ElectedAt),
+		LeaderID:  params.LeaderID,
+	})
+	if err != nil {
+		return false, interpretError(err)
+	}
+	return numResigned > 0, nil
+}
+
+func (e *Executor) MigrationDeleteAssumingMainMany(ctx context.Context, params *riverdriver.MigrationDeleteAssumingMainManyParams) ([]*riverdriver.Migration, error) {
+	migrations, err := dbsqlc.New().RiverMigrationDeleteAssumingMainMany(schemaTemplateParam(ctx, params.Schema), e.dbtx,
+		sliceutil.Map(params.Versions, func(v int) int64 { return int64(v) }))
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, func(internal *dbsqlc.RiverMigrationDeleteAssumingMainManyRow) *riverdriver.Migration {
+		return &riverdriver.Migration{
+			CreatedAt: internal.CreatedAt.UTC(),
+			Line:      riverdriver.MigrationLineMain,
+			Version:   int(internal.Version),
+		}
+	}), nil
+}
+
+func (e *Executor) MigrationDeleteByLineAndVersionMany(ctx context.Context, params *riverdriver.MigrationDeleteByLineAndVersionManyParams) ([]*riverdriver.Migration, error) {
+	migrations, err := dbsqlc.New().RiverMigrationDeleteByLineAndVersionMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.RiverMigrationDeleteByLineAndVersionManyParams{
+		Line:    params.Line,
+		Version: sliceutil.Map(params.Versions, func(v int) int64 { return int64(v) }),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, migrationFromInternal), nil
+}
+
+func (e *Executor) MigrationGetAllAssumingMain(ctx context.Context, params *riverdriver.MigrationGetAllAssumingMainParams) ([]*riverdriver.Migration, error) {
+	migrations, err := dbsqlc.New().RiverMigrationGetAllAssumingMain(schemaTemplateParam(ctx, params.Schema), e.dbtx)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, func(internal *dbsqlc.RiverMigrationGetAllAssumingMainRow) *riverdriver.Migration {
+		return &riverdriver.Migration{
+			CreatedAt: internal.CreatedAt.UTC(),
+			Line:      riverdriver.MigrationLineMain,
+			Version:   int(internal.Version),
+		}
+	}), nil
+}
+
+func (e *Executor) MigrationGetByLine(ctx context.Context, params *riverdriver.MigrationGetByLineParams) ([]*riverdriver.Migration, error) {
+	migrations, err := dbsqlc.New().RiverMigrationGetByLine(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Line)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, migrationFromInternal), nil
+}
+
+func (e *Executor) MigrationInsertMany(ctx context.Context, params *riverdriver.MigrationInsertManyParams) ([]*riverdriver.Migration, error) {
+	versions, err := json.Marshal(params.Versions)
+	if err != nil {
+		return nil, err
+	}
+
+	migrations, err := dbsqlc.New().RiverMigrationInsertMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.RiverMigrationInsertManyParams{
+		Line:     params.Line,
+		Versions: versions,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, migrationFromInternal), nil
+}
+
+func (e *Executor) MigrationInsertManyAssumingMain(ctx context.Context, params *riverdriver.MigrationInsertManyAssumingMainParams) ([]*riverdriver.Migration, error) {
+	versions, err := json.Marshal(params.Versions)
+	if err != nil {
+		return nil, err
+	}
+
+	migrations, err := dbsqlc.New().RiverMigrationInsertManyAssumingMain(schemaTemplateParam(ctx, params.Schema), e.dbtx, versions)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(migrations, func(internal *dbsqlc.RiverMigrationInsertManyAssumingMainRow) *riverdriver.Migration {
+		return &riverdriver.Migration{
+			CreatedAt: internal.CreatedAt.UTC(),
+			Line:      riverdriver.MigrationLineMain,
+			Version:   int(internal.Version),
+		}
+	}), nil
+}
+
+func (e *Executor) NotificationDeleteBefore(ctx context.Context, params *riverdriver.NotificationDeleteBeforeParams) (int, error) {
+	numDeleted, err := dbsqlc.New().NotificationDeleteBefore(
+		schemaTemplateParam(ctx, params.Schema),
+		e.dbtx,
+		&dbsqlc.NotificationDeleteBeforeParams{
+			CreatedAtHorizon: timeString(params.CreatedAtHorizon),
+			Max:              int64(params.Max),
+		},
+	)
+	return int(numDeleted), interpretError(err)
+}
+
+func (e *Executor) NotifyMany(ctx context.Context, params *riverdriver.NotifyManyParams) error {
+	if len(params.Payload) < 1 {
+		return nil
+	}
+
+	notifications, err := json.Marshal(sliceutil.Map(params.Payload, func(payload string) notificationPayload {
+		return notificationPayload{
+			Payload: payload,
+			Topic:   params.Topic,
+		}
+	}))
+	if err != nil {
+		return err
+	}
+
+	return dbsqlc.New().NotificationInsertMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, notifications)
+}
+
+func (e *Executor) Ping(ctx context.Context) error {
+	return e.Exec(ctx, "SELECT 1")
+}
+
+func (e *Executor) PGAdvisoryXactLock(ctx context.Context, key int64) (*struct{}, error) {
+	return nil, riverdriver.ErrNotImplemented
+}
+
+func (e *Executor) QueueCreateOrSetUpdatedAt(ctx context.Context, params *riverdriver.QueueCreateOrSetUpdatedAtParams) (*rivertype.Queue, error) {
+	queue, err := dbsqlc.New().QueueCreateOrSetUpdatedAt(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueCreateOrSetUpdatedAtParams{
+		Metadata:  sliceutil.FirstNonEmpty(params.Metadata, []byte("{}")),
+		Name:      params.Name,
+		Now:       timeStringNullable(params.Now),
+		PausedAt:  timeStringNullable(params.PausedAt),
+		UpdatedAt: timeStringNullable(params.UpdatedAt),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueFromInternal(queue), nil
+}
+
+func (e *Executor) QueueDeleteExpired(ctx context.Context, params *riverdriver.QueueDeleteExpiredParams) ([]string, error) {
+	queues, err := dbsqlc.New().QueueDeleteExpired(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueDeleteExpiredParams{
+		Max:              int64(params.Max),
+		UpdatedAtHorizon: timeString(params.UpdatedAtHorizon),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	queueNames := make([]string, len(queues))
+	for i, q := range queues {
+		queueNames[i] = q.Name
+	}
+	return queueNames, nil
+}
+
+func (e *Executor) QueueGet(ctx context.Context, params *riverdriver.QueueGetParams) (*rivertype.Queue, error) {
+	queue, err := dbsqlc.New().QueueGet(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Name)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueFromInternal(queue), nil
+}
+
+func (e *Executor) QueueList(ctx context.Context, params *riverdriver.QueueListParams) ([]*rivertype.Queue, error) {
+	queues, err := dbsqlc.New().QueueList(schemaTemplateParam(ctx, params.Schema), e.dbtx, int64(params.Max))
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sliceutil.Map(queues, queueFromInternal), nil
+}
+
+func (e *Executor) QueueNameList(ctx context.Context, params *riverdriver.QueueNameListParams) ([]string, error) {
+	exclude := params.Exclude
+	if len(exclude) == 0 {
+		exclude = []string{""}
+	}
+	queueNames, err := dbsqlc.New().QueueNameList(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueNameListParams{
+		After:   params.After,
+		Exclude: exclude,
+		Match:   params.Match,
+		Max:     int64(min(params.Max, math.MaxInt32)),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueNames, nil
+}
+
+func (e *Executor) QueuePause(ctx context.Context, params *riverdriver.QueuePauseParams) error {
+	// `execresult` doesn't seem to return the right number of rows affected in
+	// SQLite under every circumstance, so use a `many` return instead.
+	rowsAffected, err := dbsqlc.New().QueuePause(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueuePauseParams{
+		Name: params.Name,
+		Now:  timeStringNullable(params.Now),
+	})
+	if err != nil {
+		return interpretError(err)
+	}
+	if rowsAffected < 1 && params.Name != riverdriver.AllQueuesString {
+		return rivertype.ErrNotFound
+	}
+	return nil
+}
+
+func (e *Executor) QueueResume(ctx context.Context, params *riverdriver.QueueResumeParams) error {
+	// `execresult` doesn't seem to return the right number of rows affected in
+	// SQLite under every circumstance, so use a `many` return instead.
+	rowsAffected, err := dbsqlc.New().QueueResume(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueResumeParams{
+		Name: params.Name,
+		Now:  timeStringNullable(params.Now),
+	})
+	if err != nil {
+		return interpretError(err)
+	}
+	if rowsAffected < 1 && params.Name != riverdriver.AllQueuesString {
+		return rivertype.ErrNotFound
+	}
+	return nil
+}
+
+func (e *Executor) QueueUpdate(ctx context.Context, params *riverdriver.QueueUpdateParams) (*rivertype.Queue, error) {
+	queue, err := dbsqlc.New().QueueUpdate(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.QueueUpdateParams{
+		Metadata:         sliceutil.FirstNonEmpty(params.Metadata, []byte("{}")),
+		MetadataDoUpdate: params.MetadataDoUpdate,
+		Name:             params.Name,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return queueFromInternal(queue), nil
+}
+
+func (e *Executor) QueryRow(ctx context.Context, sql string, args ...any) riverdriver.Row {
+	return e.dbtx.QueryRowContext(ctx, sql, args...)
+}
+
+func (e *Executor) SchemaCreate(ctx context.Context, params *riverdriver.SchemaCreateParams) error {
+	return nil
+}
+
+// Most of these probably don't exist, but may have been leftover.
+var possibleExtensions = []string{ //nolint:gochecknoglobals
+	"sqlite3",
+	"sqlite3-journal",
+	"sqlite3-shm",
+	"sqlite3-wal",
+}
+
+// Gets an SQLite test directory at project root so it's invariant of which
+// package tests are being run in.
+var sqliteTestDir = sync.OnceValue(func() string { //nolint:gochecknoglobals
+	var (
+		_, filename, _, _ = runtime.Caller(0)
+		rootDir           = path.Join(path.Dir(filename), "..", "..")
+	)
+	return path.Join(rootDir, "sqlite")
+})
+
+func (e *Executor) SchemaDrop(ctx context.Context, params *riverdriver.SchemaDropParams) error {
+	for _, possibleExtension := range possibleExtensions {
+		if err := os.Remove(fmt.Sprintf("%s/%s.%s", sqliteTestDir(), params.Schema, possibleExtension)); !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (e *Executor) SchemaGetExpired(ctx context.Context, params *riverdriver.SchemaGetExpiredParams) ([]string, error) {
+	if err := os.MkdirAll(sqliteTestDir(), 0o700); err != nil {
+		return nil, err
+	}
+
+	schemaEntries, err := os.ReadDir(sqliteTestDir())
+	if err != nil {
+		return nil, err
+	}
+
+	expiredSchemas := make([]string, 0, len(schemaEntries))
+	for _, schemaEntry := range schemaEntries {
+		if !strings.HasPrefix(schemaEntry.Name(), params.Prefix) {
+			continue
+		}
+
+		if strings.Compare(schemaEntry.Name(), params.BeforeName) >= 0 {
+			continue
+		}
+
+		// Strip the extension because it'll be added back by SchemaDrop.
+		expiredSchemas = append(expiredSchemas,
+			strings.TrimSuffix(schemaEntry.Name(), filepath.Ext(schemaEntry.Name())),
+		)
+	}
+
+	return expiredSchemas, nil
+}
+
+func (e *Executor) TableExists(ctx context.Context, params *riverdriver.TableExistsParams) (bool, error) {
+	exists, err := dbsqlc.New().TableExists(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Table)
+	return exists, interpretError(err)
+}
+
+func (e *Executor) TableTruncate(ctx context.Context, params *riverdriver.TableTruncateParams) error {
+	var maybeSchema string
+	if params.Schema != "" {
+		maybeSchema = dbutil.SafeIdentifier(params.Schema) + "."
+	}
+
+	// SQLite doesn't have a `TRUNCATE` command, but `DELETE FROM` is optimized
+	// as a truncate as long as it doesn't have a `RETURNING` clause or
+	// triggers. Unfortunately unlike `TRUNCATE`, we do have to  issue
+	// operations in a loop, but given SQLite is probably largely local, that
+	// should be okay.
+	for _, table := range params.Table {
+		_, err := e.dbtx.ExecContext(ctx, "DELETE FROM "+maybeSchema+table)
+		if err != nil {
+			return interpretError(err)
+		}
+	}
+
+	return nil
+}
+
+// executor preserves transaction identity when a method is invoked through an
+// embedded Executor, so transaction helpers can reuse it without a savepoint.
+func (e *Executor) executor() riverdriver.Executor {
+	if e.execTx != nil {
+		return e.execTx
+	}
+	return e
+}
+
+type ExecutorTx struct {
+	Executor
+
+	releaseConnFunc func()
+	tx              *sql.Tx
+}
+
+func (t *ExecutorTx) Begin(ctx context.Context) (riverdriver.ExecutorTx, error) {
+	executorSubTx := &ExecutorSubTx{
+		beginOnce:    &savepointutil.BeginOnlyOnce{},
+		savepointNum: 0,
+		tx:           t.tx,
+	}
+	executorSubTx.Executor = Executor{nil, templateReplaceWrapper{t.tx, &t.driver.replacer}, t.driver, executorSubTx}
+	return executorSubTx.Begin(ctx)
+}
+
+func (t *ExecutorTx) Commit(ctx context.Context) error {
+	if t.releaseConnFunc != nil {
+		defer t.releaseConnFunc()
+	}
+	// unfortunately, `database/sql` does not take a context ...
+	return t.tx.Commit()
+}
+
+func (t *ExecutorTx) Rollback(ctx context.Context) error {
+	if t.releaseConnFunc != nil {
+		defer t.releaseConnFunc()
+	}
+	// unfortunately, `database/sql` does not take a context ...
+	return t.tx.Rollback()
+}
+
+type ExecutorSubTx struct {
+	Executor
+
+	beginOnce    *savepointutil.BeginOnlyOnce
+	savepointNum int
+	tx           *sql.Tx
+}
+
+const savepointPrefix = "river_savepoint_"
+
+func (t *ExecutorSubTx) Begin(ctx context.Context) (riverdriver.ExecutorTx, error) {
+	if err := t.beginOnce.Begin(); err != nil {
+		return nil, err
+	}
+
+	nextSavepointNum := t.savepointNum + 1
+	if err := t.Exec(ctx, fmt.Sprintf("SAVEPOINT %s%02d", savepointPrefix, nextSavepointNum)); err != nil {
+		return nil, err
+	}
+
+	executorSubTx := &ExecutorSubTx{
+		beginOnce:    savepointutil.NewBeginOnlyOnce(t.beginOnce),
+		savepointNum: nextSavepointNum,
+		tx:           t.tx,
+	}
+	executorSubTx.Executor = Executor{nil, templateReplaceWrapper{t.tx, &t.driver.replacer}, t.driver, executorSubTx}
+
+	return executorSubTx, nil
+}
+
+func (t *ExecutorSubTx) Commit(ctx context.Context) error {
+	defer t.beginOnce.Done()
+
+	if t.beginOnce.IsDone() {
+		return errors.New("tx is closed") // mirrors pgx's behavior for this condition
+	}
+
+	// Release destroys a savepoint, keeping all the effects of commands that
+	// were run within it (so it's effectively COMMIT for savepoints).
+	if err := t.Exec(ctx, fmt.Sprintf("RELEASE %s%02d", savepointPrefix, t.savepointNum)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *ExecutorSubTx) Rollback(ctx context.Context) error {
+	defer t.beginOnce.Done()
+
+	if t.beginOnce.IsDone() {
+		return errors.New("tx is closed") // mirrors pgx's behavior for this condition
+	}
+
+	if err := t.Exec(ctx, fmt.Sprintf("ROLLBACK TO %s%02d", savepointPrefix, t.savepointNum)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func interpretError(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return rivertype.ErrNotFound
+	}
+	return err
+}
+
+type templateReplaceWrapper struct {
+	dbtx     dbsqlc.DBTX
+	replacer *sqlctemplate.Replacer
+}
+
+func (w templateReplaceWrapper) ExecContext(ctx context.Context, sql string, args ...any) (sql.Result, error) {
+	sql, args = w.replacer.Run(ctx, argPlaceholder, sql, args)
+	return w.dbtx.ExecContext(ctx, sql, args...)
+}
+
+func (w templateReplaceWrapper) PrepareContext(ctx context.Context, sql string) (*sql.Stmt, error) {
+	sql, _ = w.replacer.Run(ctx, argPlaceholder, sql, nil)
+	return w.dbtx.PrepareContext(ctx, sql)
+}
+
+func (w templateReplaceWrapper) QueryContext(ctx context.Context, sql string, args ...any) (*sql.Rows, error) {
+	sql, args = w.replacer.Run(ctx, argPlaceholder, sql, args)
+	return w.dbtx.QueryContext(ctx, sql, args...)
+}
+
+func (w templateReplaceWrapper) QueryRowContext(ctx context.Context, sql string, args ...any) *sql.Row {
+	sql, args = w.replacer.Run(ctx, argPlaceholder, sql, args)
+	return w.dbtx.QueryRowContext(ctx, sql, args...)
+}
+
+func durationAsString(duration time.Duration) string {
+	return strconv.FormatFloat(duration.Seconds(), 'f', 3, 64) + " seconds"
+}
+
+func sqliteJobInsertFastManyJobsParam(jobs []*riverdriver.JobInsertFastParams, uniqueNonces []string) ([]byte, error) {
+	jobsParam := make([]map[string]any, len(jobs))
+
+	for i, job := range jobs {
+		metadata := sliceutil.FirstNonEmpty(job.Metadata, []byte("{}"))
+		if uniqueNonces != nil {
+			var err error
+			metadata, err = riverdriver.UniqueInsertMetadataWithNonce(metadata, uniqueNonces[i])
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		tags, err := json.Marshal(job.Tags)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling tags: %w", err)
+		}
+
+		jobsParam[i] = map[string]any{
+			"args":          json.RawMessage(job.EncodedArgs),
+			"created_at":    timeStringNullable(job.CreatedAt),
+			"id":            job.ID,
+			"kind":          job.Kind,
+			"max_attempts":  int64(job.MaxAttempts),
+			"metadata":      json.RawMessage(metadata),
+			"priority":      int64(job.Priority),
+			"queue":         job.Queue,
+			"scheduled_at":  timeStringNullable(job.ScheduledAt),
+			"state":         string(job.State),
+			"tags":          json.RawMessage(tags),
+			"unique_key":    hex.EncodeToString(job.UniqueKey),
+			"unique_states": int64(job.UniqueStates),
+		}
+	}
+
+	return json.Marshal(jobsParam)
+}
+
+func sqliteJobInsertFullManyJobsParam(jobs []*riverdriver.JobInsertFullParams) ([]byte, error) {
+	jobsParam := make([]map[string]any, len(jobs))
+
+	for i, job := range jobs {
+		var attemptedBy json.RawMessage
+		if job.AttemptedBy != nil {
+			attemptedByBytes, err := json.Marshal(job.AttemptedBy)
+			if err != nil {
+				return nil, err
+			}
+			attemptedBy = attemptedByBytes
+		}
+
+		var errors json.RawMessage
+		if len(job.Errors) > 0 {
+			errorsBytes, err := json.Marshal(sliceutil.Map(job.Errors, func(e []byte) json.RawMessage { return json.RawMessage(e) }))
+			if err != nil {
+				return nil, err
+			}
+			errors = errorsBytes
+		}
+
+		tags, err := json.Marshal(job.Tags)
+		if err != nil {
+			return nil, err
+		}
+
+		jobsParam[i] = map[string]any{
+			"args":          json.RawMessage(job.EncodedArgs),
+			"attempt":       int64(job.Attempt),
+			"attempted_at":  timeStringNullable(job.AttemptedAt),
+			"attempted_by":  attemptedBy,
+			"created_at":    timeStringNullable(job.CreatedAt),
+			"errors":        errors,
+			"finalized_at":  timeStringNullable(job.FinalizedAt),
+			"kind":          job.Kind,
+			"max_attempts":  int64(job.MaxAttempts),
+			"metadata":      json.RawMessage(sliceutil.FirstNonEmpty(job.Metadata, []byte("{}"))),
+			"priority":      int64(job.Priority),
+			"queue":         job.Queue,
+			"scheduled_at":  timeStringNullable(job.ScheduledAt),
+			"state":         string(job.State),
+			"tags":          json.RawMessage(tags),
+			"unique_key":    hex.EncodeToString(job.UniqueKey),
+			"unique_states": int64(job.UniqueStates),
+		}
+	}
+
+	return json.Marshal(jobsParam)
+}
+
+// jobFromReturningRow converts a row from one of the job queries that list out
+// the columns in their `RETURNING` clause to tolerate values that aren't valid
+// JSON (see JobGetAvailable in the SQL) into a job. sqlc's SQLite engine
+// ignores aliases in `RETURNING`, so these rows get their own types with
+// positional names for the JSON columns. The types have identical fields
+// though, so rows of the other queries are converted to JobGetAvailableRow to
+// use this too.
+func jobFromReturningRow(row *dbsqlc.JobGetAvailableRow) *dbsqlc.RiverJob {
+	return &dbsqlc.RiverJob{
+		ID:           row.ID,
+		Args:         row.Column2,
+		Attempt:      row.Attempt,
+		AttemptedAt:  row.AttemptedAt,
+		AttemptedBy:  row.Column5,
+		CreatedAt:    row.CreatedAt,
+		Errors:       row.Column7,
+		FinalizedAt:  row.FinalizedAt,
+		Kind:         row.Kind,
+		MaxAttempts:  row.MaxAttempts,
+		Metadata:     row.Column11,
+		Priority:     row.Priority,
+		Queue:        row.Queue,
+		State:        row.State,
+		ScheduledAt:  row.ScheduledAt,
+		Tags:         row.Column16,
+		UniqueKey:    row.UniqueKey,
+		UniqueStates: row.UniqueStates,
+	}
+}
+
+// jobGetAvailableResultFromInternal decodes the job rows locked by
+// JobGetAvailable, retaining every row and recording decode errors by job ID
+// because they've all been moved to `running`.
+func jobGetAvailableResultFromInternal(jobs []*dbsqlc.RiverJob) *riverdriver.JobGetAvailableResult {
+	res := &riverdriver.JobGetAvailableResult{Jobs: make([]*rivertype.JobRow, len(jobs))}
+	for i, internal := range jobs {
+		job, err := jobRowFromInternalPartial(internal)
+		res.Jobs[i] = job
+		if err != nil {
+			if res.DecodeErrors == nil {
+				res.DecodeErrors = make(map[int64]error)
+			}
+			res.DecodeErrors[job.ID] = err
+		}
+	}
+	return res
+}
+
+// jobRowFromInternal decodes a job row, returning an error if any of its
+// fields can't be decoded.
+func jobRowFromInternal(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
+	job, err := jobRowFromInternalPartial(internal)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// jobRowFromInternalPartial decodes a job row. A row is always returned, even
+// along with an error, in which case the fields that couldn't be decoded are
+// left empty.
+func jobRowFromInternalPartial(internal *dbsqlc.RiverJob) (*rivertype.JobRow, error) {
+	var decodeErrs []error
+
+	// Args and metadata are passed through as raw JSON, but in case they've
+	// been changed out of band to something that isn't valid JSON, check that
+	// they are so the job isn't worked with them.
+	encodedArgs := internal.Args
+	if err := validateJSON(encodedArgs); err != nil {
+		decodeErrs = append(decodeErrs, fmt.Errorf("error unmarshaling `args`: %w", err))
+		encodedArgs = nil
+	}
+
+	var attemptedAt *time.Time
+	if internal.AttemptedAt != nil {
+		t := internal.AttemptedAt.UTC()
+		attemptedAt = &t
+	}
+
+	var attemptedBy []string
+	if internal.AttemptedBy != nil {
+		if err := json.Unmarshal(internal.AttemptedBy, &attemptedBy); err != nil {
+			decodeErrs = append(decodeErrs, fmt.Errorf("error unmarshaling `attempted_by`: %w", err))
+			attemptedBy = nil
+		}
+	}
+
+	attemptErrors := make([]rivertype.AttemptError, 0)
+	if internal.Errors != nil {
+		if err := riverdriver.UnmarshalAttemptErrors(internal.Errors, &attemptErrors); err != nil {
+			decodeErrs = append(decodeErrs, fmt.Errorf("error unmarshaling `errors`: %w", err))
+			attemptErrors = nil
+		}
+	}
+
+	var finalizedAt *time.Time
+	if internal.FinalizedAt != nil {
+		t := internal.FinalizedAt.UTC()
+		finalizedAt = &t
+	}
+
+	metadata := internal.Metadata
+	if err := validateJSON(metadata); err != nil {
+		decodeErrs = append(decodeErrs, fmt.Errorf("error unmarshaling `metadata`: %w", err))
+		metadata = nil
+	}
+
+	var tags []string
+	if err := json.Unmarshal(internal.Tags, &tags); err != nil {
+		decodeErrs = append(decodeErrs, fmt.Errorf("error unmarshaling `tags`: %w", err))
+		tags = nil
+	}
+
+	var uniqueStatesByte byte
+	if internal.UniqueStates != nil {
+		if *internal.UniqueStates < 0 || *internal.UniqueStates > 255 {
+			decodeErrs = append(decodeErrs, fmt.Errorf("value out of range for byte: %d", *internal.UniqueStates))
+		} else {
+			uniqueStatesByte = byte(*internal.UniqueStates)
+		}
+	}
+
+	return &rivertype.JobRow{
+		ID:           internal.ID,
+		Attempt:      max(int(internal.Attempt), 0),
+		AttemptedAt:  attemptedAt,
+		AttemptedBy:  attemptedBy,
+		CreatedAt:    internal.CreatedAt.UTC(),
+		EncodedArgs:  encodedArgs,
+		Errors:       attemptErrors,
+		FinalizedAt:  finalizedAt,
+		Kind:         internal.Kind,
+		MaxAttempts:  max(int(internal.MaxAttempts), 0),
+		Metadata:     metadata,
+		Priority:     max(int(internal.Priority), 0),
+		Queue:        internal.Queue,
+		ScheduledAt:  internal.ScheduledAt.UTC(),
+		State:        rivertype.JobState(internal.State),
+		Tags:         tags,
+		UniqueKey:    internal.UniqueKey,
+		UniqueStates: uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
+	}, errors.Join(decodeErrs...)
+}
+
+// jobRowsFromInternalPartial decodes job rows with jobRowFromInternalPartial,
+// ignoring decode errors so that one bad row doesn't prevent returning the
+// others.
+func jobRowsFromInternalPartial(jobs []*dbsqlc.RiverJob) []*rivertype.JobRow {
+	return sliceutil.Map(jobs, func(internal *dbsqlc.RiverJob) *rivertype.JobRow {
+		job, _ := jobRowFromInternalPartial(internal)
+		return job
+	})
+}
+
+func leaderFromInternal(internal *dbsqlc.RiverLeader) *riverdriver.Leader {
+	return &riverdriver.Leader{
+		ElectedAt: internal.ElectedAt.UTC(),
+		ExpiresAt: internal.ExpiresAt.UTC(),
+		LeaderID:  internal.LeaderID,
+	}
+}
+
+func migrationFromInternal(internal *dbsqlc.RiverMigration) *riverdriver.Migration {
+	return &riverdriver.Migration{
+		CreatedAt: internal.CreatedAt.UTC(),
+		Line:      internal.Line,
+		Version:   int(internal.Version),
+	}
+}
+
+// metadataMergeSQL is shared by job updates and both completion paths. sqlc
+// cannot resolve this expression's CTEs, so use the existing template mechanism.
+// The fixed SQL and parameter names keep the template replacer's cache enabled.
+//
+//go:embed metadata_merge.sql
+var metadataMergeSQL string
+
+func metadataMergeTemplateParam(ctx context.Context, metadataUpdates []byte) context.Context {
+	return sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"metadata_merge_clause": {Stable: true, Value: metadataMergeSQL},
+	}, map[string]any{
+		"metadata_merge_updates": string(sliceutil.FirstNonEmpty(metadataUpdates, []byte("{}"))),
+	})
+}
+
+func schemaTemplateParam(ctx context.Context, schema string) context.Context {
+	if schema != "" {
+		schema = dbutil.SafeIdentifier(schema) + "."
+	}
+
+	return sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"schema": {Value: schema, Stable: true},
+	}, nil)
+}
+
+func queueFromInternal(internal *dbsqlc.RiverQueue) *rivertype.Queue {
+	var pausedAt *time.Time
+	if internal.PausedAt != nil {
+		t := internal.PausedAt.UTC()
+		pausedAt = &t
+	}
+	return &rivertype.Queue{
+		CreatedAt: internal.CreatedAt.UTC(),
+		Metadata:  internal.Metadata,
+		Name:      internal.Name,
+		PausedAt:  pausedAt,
+		UpdatedAt: internal.UpdatedAt.UTC(),
+	}
+}
+
+func timeString(t time.Time) string {
+	// SQLite times are really strings, and may god help your immortal soul if
+	// you don't use this exact format when storing them (including similar
+	// looking more common formats like RFC3339). They'll store fine, produce no
+	// warnings, and then just won't compare properly against built-ins, causing
+	// everything to fail in non-obvious ways.
+	const sqliteFormat = "2006-01-02 15:04:05.000"
+
+	return t.UTC().Round(time.Millisecond).Format(sqliteFormat)
+}
+
+// This is kind of unfortunate, but I've found it the easiest way to encode an
+// optional date/time. Unfortunately sqlc (or the driver? not sure) will write a
+// `*time.Time` as an integer (presumably a Unix timestamp), and then be unable
+// to scan it back into a `time.Time`. This workaround has us cast input time
+// parameters as `text`, then do the encoding to a string ourselves (SQLite has
+// no date/time type, only `integer` or `text`) to make sure it's in our desired
+// target format.
+func timeStringNullable(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+
+	str := timeString(*t)
+	return &str
+}
+
+// validateJSON returns an error describing why data isn't valid JSON, or nil if
+// it is.
+func validateJSON(data []byte) error {
+	if json.Valid(data) {
+		return nil
+	}
+	return json.Unmarshal(data, new(json.RawMessage))
+}
